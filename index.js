@@ -500,12 +500,19 @@ function handleGenerateAfterData(generate_data, dryRun) {
  * Handle GENERATION_STARTED event - capture pre-continue state
  * This fires before the API call, allowing us to snapshot the current message state
  * for 'continue' type generations so we can calculate the delta later.
- * @param {string} type - Generation type: 'normal', 'continue', 'swipe', 'regenerate', etc.
+ * @param {string} type - Generation type: 'normal', 'continue', 'swipe', 'regenerate', 'quiet', etc.
  * @param {object} params - Generation parameters
  * @param {boolean} isDryRun - Whether this is a dry run
  */
+let isQuietGeneration = false;
+let isImpersonateGeneration = false;
+
 async function handleGenerationStarted(type, params, isDryRun) {
     if (isDryRun) return;
+
+    // Track the generation type for special handling
+    isQuietGeneration = (type === 'quiet');
+    isImpersonateGeneration = (type === 'impersonate');
 
     // Reset pre-continue state
     preContinueTokenCount = 0;
@@ -528,7 +535,6 @@ async function handleGenerationStarted(type, params, isDryRun) {
                     }
                     preContinueTokenCount = tokens;
                 }
-                console.log(`[Token Usage Tracker] Pre-continue token count: ${preContinueTokenCount}`);
             }
         } catch (error) {
             console.error('[Token Usage Tracker] Error capturing pre-continue state:', error);
@@ -675,8 +681,49 @@ function handleChatChanged(chatId) {
     pendingInputTokensPromise = null;
     pendingModelId = null;
     preContinueTokenCount = 0;
+    isQuietGeneration = false;
+    isImpersonateGeneration = false;
     console.log(`[Token Usage Tracker] Chat changed to: ${chatId}`);
     eventSource.emit('tokenUsageUpdated', getUsageStats());
+}
+
+/**
+ * Handle impersonate ready event - count output tokens for impersonation
+ * This fires when impersonation completes and puts text into the input field
+ * @param {string} text - The generated impersonation text
+ */
+async function handleImpersonateReady(text) {
+    if (!pendingInputTokensPromise) return;
+
+    try {
+
+        // Await the input token counting that was started in handleGenerateAfterData
+        const inputTokens = await pendingInputTokensPromise;
+        const modelId = pendingModelId;
+        pendingInputTokensPromise = null;
+        pendingModelId = null;
+
+        // Count output tokens from the impersonated text
+        let outputTokens = 0;
+        if (text && typeof text === 'string') {
+            outputTokens = await countTokens(text);
+        }
+
+        // Get current chat ID if available
+        const context = getContext();
+        const chatId = context.chatMetadata?.chat_id || null;
+
+        recordUsage(inputTokens, outputTokens, chatId, modelId);
+
+
+        // Reset impersonate state
+        isImpersonateGeneration = false;
+    } catch (error) {
+        console.error('[Token Usage Tracker] Error handling impersonate ready:', error);
+        pendingInputTokensPromise = null;
+        pendingModelId = null;
+        isImpersonateGeneration = false;
+    }
 }
 
 function registerSlashCommands() {
@@ -1570,78 +1617,116 @@ function createSettingsUI() {
 let isTrackingBackground = false;
 
 function patchBackgroundGenerations() {
-    patchGenerateQuiet();
+    patchGenerateQuietPrompt();
     patchConnectionManager();
 }
 
-function patchGenerateQuiet() {
-    if (window.generateQuiet?._isPatched) return;
+function patchGenerateQuietPrompt() {
+    // For quiet generations (Guided Generations, Summarize, Expressions, etc.),
+    // MESSAGE_RECEIVED doesn't fire. Flush pending tokens on next generation or chat change.
+    eventSource.on(event_types.GENERATION_STARTED, async (type, params, dryRun) => {
+        if (dryRun) return;
+        if (isQuietGeneration && pendingInputTokensPromise) {
+            await flushQuietGeneration();
+        }
+    });
 
-    // Handle snake_case variant
-    if (typeof window.generateQuiet !== 'function' && typeof window.generate_quiet === 'function') {
-        console.log('[Token Usage Tracker] patching generate_quiet');
-        const original = window.generate_quiet;
-        window.generate_quiet = async function(prompt, ...args) {
-            return await handleBackgroundGeneration(original, this, [prompt, ...args], async () => {
-                // Input calculation for generateQuiet (usually string)
-                if (typeof prompt === 'string') return await countTokens(prompt);
-                if (Array.isArray(prompt)) return await countInputTokens({ prompt });
-                return 0;
-            }, async (result) => {
-                // Output calculation
-                return typeof result === 'string' ? await countTokens(result) : 0;
-            });
-        };
-        window.generate_quiet._isPatched = true;
-        return;
-    }
+    eventSource.on(event_types.CHAT_CHANGED, async () => {
+        if (isQuietGeneration && pendingInputTokensPromise) {
+            await flushQuietGeneration();
+        }
+    });
+}
 
-    if (typeof window.generateQuiet === 'function') {
-        console.log('[Token Usage Tracker] Patching generateQuiet');
-        const original = window.generateQuiet;
-        window.generateQuiet = async function(prompt, ...args) {
-            return await handleBackgroundGeneration(original, this, [prompt, ...args], async () => {
-                if (typeof prompt === 'string') return await countTokens(prompt);
-                if (Array.isArray(prompt)) return await countInputTokens({ prompt });
-                return 0;
-            }, async (result) => {
-                return typeof result === 'string' ? await countTokens(result) : 0;
-            });
-        };
-        window.generateQuiet._isPatched = true;
+/**
+ * Flush a pending quiet generation, recording tokens from what we have
+ */
+async function flushQuietGeneration() {
+    if (!pendingInputTokensPromise) return;
+
+    try {
+        const inputTokens = await pendingInputTokensPromise;
+        const modelId = pendingModelId;
+
+        // Try to get output from streaming processor
+        let outputTokens = 0;
+        if (streamingProcessor?.result) {
+            outputTokens = await countTokens(streamingProcessor.result);
+        }
+
+        // Record the usage
+        if (inputTokens > 0 || outputTokens > 0) {
+            recordUsage(inputTokens, outputTokens, null, modelId);
+        }
+    } catch (e) {
+        console.error('[Token Usage Tracker] Error flushing quiet generation:', e);
+    } finally {
+        // Reset state
+        pendingInputTokensPromise = null;
+        pendingModelId = null;
+        isQuietGeneration = false;
     }
 }
 
 function patchConnectionManager() {
-    // Poll for the service as it might load after this extension
+    // Poll for ConnectionManagerRequestService (used by Roadway and similar extensions)
     const checkInterval = setInterval(() => {
         try {
             const context = getContext();
-            const service = context?.ConnectionManagerRequestService;
+            const ServiceClass = context?.ConnectionManagerRequestService;
 
-            if (service && typeof service.sendRequest === 'function' && !service.sendRequest._isPatched) {
-                console.log('[Token Usage Tracker] Patching ConnectionManagerRequestService.sendRequest');
-                const original = service.sendRequest;
-
-                service.sendRequest = async function(profileId, messages, ...args) {
-                    return await handleBackgroundGeneration(original, this, [profileId, messages, ...args], async () => {
-                        // Input calculation (messages array)
-                        // Wrapping in object to match countInputTokens signature expectation
-                        return await countInputTokens({ prompt: messages });
-                    }, async (result) => {
-                        // Output calculation (ExtractedData .content)
-                        if (result && typeof result.content === 'string') {
-                            return await countTokens(result.content);
-                        }
-                        return 0;
-                    });
-                };
-
-                service.sendRequest._isPatched = true;
+            if (!ServiceClass || typeof ServiceClass.sendRequest !== 'function') return;
+            if (ServiceClass.sendRequest._isPatched) {
                 clearInterval(checkInterval);
+                return;
             }
+
+            const originalSendRequest = ServiceClass.sendRequest.bind(ServiceClass);
+
+            ServiceClass.sendRequest = async function(profileId, messages, maxTokens, custom, overridePayload) {
+                if (isTrackingBackground) {
+                    return await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
+                }
+
+                let inputTokens = 0;
+                const modelId = getCurrentModelId();
+
+                try {
+                    isTrackingBackground = true;
+
+                    try {
+                        inputTokens = await countInputTokens({ prompt: messages });
+                    } catch (e) {
+                        console.error('[Token Usage Tracker] Error counting sendRequest input:', e);
+                    }
+
+                    const result = await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
+
+                    try {
+                        let outputTokens = 0;
+                        if (result && typeof result.content === 'string') {
+                            outputTokens = await countTokens(result.content);
+                        } else if (typeof result === 'string') {
+                            outputTokens = await countTokens(result);
+                        }
+
+                        if (outputTokens > 0 || inputTokens > 0) {
+                            recordUsage(inputTokens, outputTokens, null, modelId);
+                        }
+                    } catch (e) {
+                        console.error('[Token Usage Tracker] Error counting sendRequest output:', e);
+                    }
+
+                    return result;
+                } finally {
+                    isTrackingBackground = false;
+                }
+            };
+
+            ServiceClass.sendRequest._isPatched = true;
+            clearInterval(checkInterval);
         } catch (e) {
-            // Ignore errors during polling
+            console.error('[Token Usage Tracker] Error in patchConnectionManager:', e);
         }
     }, 1000);
 
@@ -1709,6 +1794,7 @@ jQuery(async () => {
     eventSource.on(event_types.MESSAGE_RECEIVED, handleMessageReceived);
     eventSource.on(event_types.GENERATION_STOPPED, handleGenerationStopped);
     eventSource.on(event_types.CHAT_CHANGED, handleChatChanged);
+    eventSource.on(event_types.IMPERSONATE_READY, handleImpersonateReady);
 
     // Log current tokenizer
     try {
