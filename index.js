@@ -18,6 +18,71 @@ import { textgenerationwebui_settings as textgen_settings } from '../../../textg
 
 const extensionName = 'token-usage-tracker';
 
+// External time source configuration
+const EASTERN_TIMEZONE = 'America/New_York';
+let externalTimeOffset = null; // Offset between local time and external time (in ms)
+let lastTimeSyncTimestamp = null;
+const TIME_SYNC_INTERVAL = 5 * 60 * 1000; // Re-sync every 5 minutes
+
+/**
+ * Fetch current time from external source (worldtimeapi.org)
+ * @returns {Promise<Date|null>} Date object with external time, or null on failure
+ */
+async function fetchExternalTime() {
+    try {
+        const response = await fetch(`https://worldtimeapi.org/api/timezone/${EASTERN_TIMEZONE}`);
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        // datetime format: "2025-01-10T14:25:00.123456-05:00"
+        const externalDate = new Date(data.datetime);
+        return externalDate;
+    } catch (error) {
+        console.warn('[Token Usage Tracker] Failed to fetch external time:', error.message);
+        return null;
+    }
+}
+
+/**
+ * Sync time offset with external source
+ * Calculates the difference between local system time and external time
+ */
+async function syncTimeOffset() {
+    const externalTime = await fetchExternalTime();
+    if (externalTime) {
+        const localTime = new Date();
+        externalTimeOffset = externalTime.getTime() - localTime.getTime();
+        lastTimeSyncTimestamp = Date.now();
+        console.log(`[Token Usage Tracker] Time synced with external source. Offset: ${externalTimeOffset}ms`);
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Get current time in Eastern timezone, using external source when available
+ * Falls back to local time converted to Eastern if external sync fails
+ * @returns {Date} Date object representing current Eastern time
+ */
+function getCurrentEasternTime() {
+    // Check if we need to re-sync (async, non-blocking)
+    if (!lastTimeSyncTimestamp || (Date.now() - lastTimeSyncTimestamp > TIME_SYNC_INTERVAL)) {
+        syncTimeOffset(); // Fire and forget - don't await
+    }
+    
+    let now;
+    if (externalTimeOffset !== null) {
+        // Apply cached offset to get corrected time
+        now = new Date(Date.now() + externalTimeOffset);
+    } else {
+        // Fallback: convert local time to Eastern timezone
+        now = new Date(new Date().toLocaleString('en-US', { timeZone: EASTERN_TIMEZONE }));
+    }
+    
+    return now;
+}
+
 const defaultSettings = {
     showInTopBar: true,
     modelColors: {}, // { "gpt-4o": "#6366f1", "claude-3-opus": "#8b5cf6", ... }
@@ -87,7 +152,7 @@ function loadSettings() {
 
     // Initialize session start time
     if (!settings.usage.session.startTime) {
-        settings.usage.session.startTime = new Date().toISOString();
+        settings.usage.session.startTime = getCurrentEasternTime().toISOString();
     }
 
     return settings;
@@ -110,7 +175,7 @@ function getSettings() {
 /**
  * Get the current day key (YYYY-MM-DD)
  */
-function getDayKey(date = new Date()) {
+function getDayKey(date = getCurrentEasternTime()) {
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
@@ -120,7 +185,7 @@ function getDayKey(date = new Date()) {
 /**
  * Get the current hour key (YYYY-MM-DDTHH)
  */
-function getHourKey(date = new Date()) {
+function getHourKey(date = getCurrentEasternTime()) {
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
@@ -131,7 +196,7 @@ function getHourKey(date = new Date()) {
 /**
  * Get the current week key (YYYY-WNN)
  */
-function getWeekKey(date = new Date()) {
+function getWeekKey(date = getCurrentEasternTime()) {
     const year = date.getFullYear();
     const startOfYear = new Date(year, 0, 1);
     const days = Math.floor((date.getTime() - startOfYear.getTime()) / (24 * 60 * 60 * 1000));
@@ -142,7 +207,7 @@ function getWeekKey(date = new Date()) {
 /**
  * Get the current month key (YYYY-MM)
  */
-function getMonthKey(date = new Date()) {
+function getMonthKey(date = getCurrentEasternTime()) {
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     return `${year}-${month}`;
@@ -218,7 +283,7 @@ function getCurrentSourceId() {
 function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, sourceId = null, reasoningTokens = 0) {
     const settings = getSettings();
     const usage = settings.usage;
-    const now = new Date();
+    const now = getCurrentEasternTime();
     const totalTokens = inputTokens + outputTokens + reasoningTokens;
 
     const addTokens = (bucket) => {
@@ -311,7 +376,7 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, s
     saveSettings();
 
     // Update health tracking timestamp
-    lastRecordedTimestamp = new Date().toISOString();
+    lastRecordedTimestamp = getCurrentEasternTime().toISOString();
 
     // Emit custom event for UI updates
     eventSource.emit('tokenUsageUpdated', getUsageStats());
@@ -329,7 +394,7 @@ function resetSession() {
         output: 0,
         total: 0,
         messageCount: 0,
-        startTime: new Date().toISOString(),
+        startTime: getCurrentEasternTime().toISOString(),
     };
     saveSettings();
     eventSource.emit('tokenUsageUpdated', getUsageStats());
@@ -342,7 +407,7 @@ function resetSession() {
 function resetAllUsage() {
     const settings = getSettings();
     settings.usage = structuredClone(defaultSettings.usage);
-    settings.usage.session.startTime = new Date().toISOString();
+    settings.usage.session.startTime = getCurrentEasternTime().toISOString();
     saveSettings();
     eventSource.emit('tokenUsageUpdated', getUsageStats());
     console.log('[Token Usage Tracker] All usage data reset');
@@ -355,7 +420,7 @@ function resetAllUsage() {
 function getUsageStats() {
     const settings = getSettings();
     const usage = settings.usage;
-    const now = new Date();
+    const now = getCurrentEasternTime();
 
     // Get current tokenizer info for display
     let tokenizerInfo = { tokenizerName: 'Unknown' };
@@ -1291,7 +1356,7 @@ function getHealthStatus() {
  * @param {string} message - Error message
  */
 function recordHealthError(message) {
-    lastErrorTimestamp = new Date().toISOString();
+    lastErrorTimestamp = getCurrentEasternTime().toISOString();
     lastErrorMessage = message;
 }
 
@@ -1322,7 +1387,7 @@ function getChartData(days, sourceFilter = 'all') {
     const stats = getUsageStats();
     const byDay = stats.byDay || {};
     const data = [];
-    const today = new Date();
+    const today = getCurrentEasternTime();
 
     for (let i = days - 1; i >= 0; i--) {
         const date = new Date(today);
@@ -1375,7 +1440,7 @@ function getHourlyChartData(hours, sourceFilter = 'all') {
     const settings = getSettings();
     const byHour = settings.usage.byHour || {};
     const data = [];
-    const now = new Date();
+    const now = getCurrentEasternTime();
 
     for (let i = hours - 1; i >= 0; i--) {
         const date = new Date(now);
@@ -1978,7 +2043,7 @@ function updateSourceDropdown() {
  */
 function updateUIStats() {
     const stats = getUsageStats();
-    const now = new Date();
+    const now = getCurrentEasternTime();
 
     // Today header
     $('#token-usage-today-total').text(formatTokens(stats.today.total));
@@ -2658,6 +2723,15 @@ async function handleBackgroundGeneration(originalFn, context, args, inputCounte
 
 jQuery(async () => {
     console.log('[Token Usage Tracker] Initializing...');
+
+    // Sync time with external source on startup
+    syncTimeOffset().then(success => {
+        if (success) {
+            console.log('[Token Usage Tracker] External time sync successful');
+        } else {
+            console.log('[Token Usage Tracker] Using local time with Eastern timezone conversion');
+        }
+    });
 
     loadSettings();
     registerSlashCommands();
