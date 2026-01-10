@@ -18,11 +18,30 @@ import { textgenerationwebui_settings as textgen_settings } from '../../../textg
 
 const extensionName = 'token-usage-tracker';
 
-// External time source configuration
 const EASTERN_TIMEZONE = 'America/New_York';
 let externalTimeOffset = null; // Offset between local time and external time (in ms)
 let lastTimeSyncTimestamp = null;
 const TIME_SYNC_INTERVAL = 5 * 60 * 1000; // Re-sync every 5 minutes
+
+function getEasternParts(date) {
+    const dtf = new Intl.DateTimeFormat('en-US', {
+        timeZone: EASTERN_TIMEZONE,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        hourCycle: 'h23',
+    });
+
+    const parts = dtf.formatToParts(date);
+    const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
+    return {
+        year: Number(map.year),
+        month: Number(map.month),
+        day: Number(map.day),
+        hour: Number(map.hour),
+    };
+}
 
 /**
  * Fetch current time from external source (worldtimeapi.org)
@@ -35,8 +54,12 @@ async function fetchExternalTime() {
             throw new Error(`HTTP ${response.status}`);
         }
         const data = await response.json();
-        // datetime format: "2025-01-10T14:25:00.123456-05:00"
-        const externalDate = new Date(data.datetime);
+        const externalDate = (typeof data?.unixtime === 'number')
+            ? new Date(data.unixtime * 1000)
+            : new Date(data?.datetime);
+        if (Number.isNaN(externalDate.getTime())) {
+            throw new Error('Invalid datetime from external time source');
+        }
         return externalDate;
     } catch (error) {
         console.warn('[Token Usage Tracker] Failed to fetch external time:', error.message);
@@ -52,7 +75,12 @@ async function syncTimeOffset() {
     const externalTime = await fetchExternalTime();
     if (externalTime) {
         const localTime = new Date();
-        externalTimeOffset = externalTime.getTime() - localTime.getTime();
+        const offset = externalTime.getTime() - localTime.getTime();
+        if (!Number.isFinite(offset)) {
+            console.warn('[Token Usage Tracker] External time offset is not finite');
+            return false;
+        }
+        externalTimeOffset = offset;
         lastTimeSyncTimestamp = Date.now();
         console.log(`[Token Usage Tracker] Time synced with external source. Offset: ${externalTimeOffset}ms`);
         return true;
@@ -70,17 +98,15 @@ function getCurrentEasternTime() {
     if (!lastTimeSyncTimestamp || (Date.now() - lastTimeSyncTimestamp > TIME_SYNC_INTERVAL)) {
         syncTimeOffset(); // Fire and forget - don't await
     }
-    
-    let now;
-    if (externalTimeOffset !== null) {
-        // Apply cached offset to get corrected time
-        now = new Date(Date.now() + externalTimeOffset);
-    } else {
-        // Fallback: convert local time to Eastern timezone
-        now = new Date(new Date().toLocaleString('en-US', { timeZone: EASTERN_TIMEZONE }));
+
+    // NOTE: A JS Date is always an absolute timestamp (ms since epoch).
+    // We apply external offset (if available) to correct the timestamp.
+    // Eastern timezone handling is done when formatting/deriving parts via Intl.
+    if (externalTimeOffset !== null && Number.isFinite(externalTimeOffset)) {
+        return new Date(Date.now() + externalTimeOffset);
     }
-    
-    return now;
+
+    return new Date();
 }
 
 const defaultSettings = {
@@ -176,31 +202,28 @@ function getSettings() {
  * Get the current day key (YYYY-MM-DD)
  */
 function getDayKey(date = getCurrentEasternTime()) {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
+    const { year, month, day } = getEasternParts(date);
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
 /**
  * Get the current hour key (YYYY-MM-DDTHH)
  */
 function getHourKey(date = getCurrentEasternTime()) {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    const hour = String(date.getHours()).padStart(2, '0');
-    return `${year}-${month}-${day}T${hour}`;
+    const { year, month, day, hour } = getEasternParts(date);
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}`;
 }
 
 /**
  * Get the current week key (YYYY-WNN)
  */
 function getWeekKey(date = getCurrentEasternTime()) {
-    const year = date.getFullYear();
-    const startOfYear = new Date(year, 0, 1);
-    const days = Math.floor((date.getTime() - startOfYear.getTime()) / (24 * 60 * 60 * 1000));
-    const weekNumber = Math.ceil((days + startOfYear.getDay() + 1) / 7);
+    const { year, month, day } = getEasternParts(date);
+    // Week calculation is based on the Eastern calendar date, but done in UTC for consistency.
+    const easternCalendarDateUtc = new Date(Date.UTC(year, month - 1, day));
+    const startOfYearUtc = new Date(Date.UTC(year, 0, 1));
+    const days = Math.floor((easternCalendarDateUtc.getTime() - startOfYearUtc.getTime()) / (24 * 60 * 60 * 1000));
+    const weekNumber = Math.ceil((days + startOfYearUtc.getUTCDay() + 1) / 7);
     return `${year}-W${String(weekNumber).padStart(2, '0')}`;
 }
 
@@ -208,9 +231,8 @@ function getWeekKey(date = getCurrentEasternTime()) {
  * Get the current month key (YYYY-MM)
  */
 function getMonthKey(date = getCurrentEasternTime()) {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    return `${year}-${month}`;
+    const { year, month } = getEasternParts(date);
+    return `${year}-${String(month).padStart(2, '0')}`;
 }
 
 /**
@@ -483,7 +505,6 @@ function getChatUsage(chatId) {
     const settings = getSettings();
     return settings.usage.byChat[chatId] || { input: 0, output: 0, total: 0, messageCount: 0 };
 }
-
 
 /** @type {Promise<number>|null} Promise that resolves to input token count - started early, awaited later */
 let pendingInputTokensPromise = null;
@@ -1210,7 +1231,7 @@ function exportUsageData() {
     const settings = getSettings();
     return {
         version: '1.0',
-        exportDate: new Date().toISOString(),
+        exportDate: getCurrentEasternTime().toISOString(),
         extensionName: extensionName,
         usage: settings.usage,
         modelPrices: settings.modelPrices,
@@ -1318,7 +1339,7 @@ function getHealthStatus() {
 
     let timeSinceActivity = null;
     if (lastRecordedTimestamp) {
-        const elapsed = Date.now() - new Date(lastRecordedTimestamp).getTime();
+        const elapsed = getCurrentEasternTime().getTime() - new Date(lastRecordedTimestamp).getTime();
         if (elapsed < 60000) {
             timeSinceActivity = Math.round(elapsed / 1000) + 's ago';
         } else if (elapsed < 3600000) {
@@ -1331,7 +1352,7 @@ function getHealthStatus() {
     }
 
     const hasRecentError = lastErrorTimestamp &&
-        (Date.now() - new Date(lastErrorTimestamp).getTime() < 300000); // Error within last 5 min
+        (getCurrentEasternTime().getTime() - new Date(lastErrorTimestamp).getTime() < 300000); // Error within last 5 min
 
     let status = 'healthy';
     if (hasRecentError) {
@@ -1390,8 +1411,7 @@ function getChartData(days, sourceFilter = 'all') {
     const today = getCurrentEasternTime();
 
     for (let i = days - 1; i >= 0; i--) {
-        const date = new Date(today);
-        date.setDate(date.getDate() - i);
+        const date = new Date(today.getTime() - i * 24 * 60 * 60 * 1000);
         const dayKey = getDayKey(date);
         const dayData = byDay[dayKey] || { total: 0, input: 0, output: 0, models: {}, sources: {} };
 
@@ -1424,8 +1444,8 @@ function getChartData(days, sourceFilter = 'all') {
             input: input,
             output: output,
             models: models,
-            displayDate: new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(date),
-            fullDate: new Intl.DateTimeFormat('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }).format(date)
+            displayDate: new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, month: 'short', day: 'numeric' }).format(date),
+            fullDate: new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }).format(date)
         });
     }
     return data;
@@ -1443,8 +1463,7 @@ function getHourlyChartData(hours, sourceFilter = 'all') {
     const now = getCurrentEasternTime();
 
     for (let i = hours - 1; i >= 0; i--) {
-        const date = new Date(now);
-        date.setHours(date.getHours() - i);
+        const date = new Date(now.getTime() - i * 60 * 60 * 1000);
         const hourKey = getHourKey(date);
         const hourData = byHour[hourKey] || { total: 0, input: 0, output: 0, messageCount: 0 };
 
@@ -1457,8 +1476,8 @@ function getHourlyChartData(hours, sourceFilter = 'all') {
             input: hourData.input || 0,
             output: hourData.output || 0,
             models: {},
-            displayDate: new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: true }).format(date),
-            fullDate: new Intl.DateTimeFormat('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', hour12: true }).format(date)
+            displayDate: new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, hour: 'numeric', hour12: true }).format(date),
+            fullDate: new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', hour12: true }).format(date)
         });
     }
     return data;
