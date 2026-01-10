@@ -1500,7 +1500,12 @@ function renderChart() {
     let barWidth = totalBarWidth * 0.8;
     if (barWidth > 40) barWidth = 40;
     const actualGap = totalBarWidth - barWidth;
-    const labelInterval = currentChartRange === 90 ? 7 : currentChartRange === 30 ? 3 : 1;
+    const maxLabels = Math.max(2, Math.floor(chartWidth / 40));
+    const hourlyLabelInterval = Math.max(1, Math.ceil(chartData.length / maxLabels));
+    const labelInterval = currentGranularity === 'hourly'
+        ? hourlyLabelInterval
+        : (currentChartRange === 90 ? 7 : currentChartRange === 30 ? 3 : 1);
+    const xLabelFontSize = chartData.length > 60 ? '9' : '10';
 
     chartData.forEach((d, i) => {
         const slotX = margin.left + (i * totalBarWidth);
@@ -1612,7 +1617,7 @@ function renderChart() {
                 'text-anchor': 'middle',
                 fill: CHART_COLORS.text,
                 opacity: '0.6',
-                'font-size': '10',
+                'font-size': xLabelFontSize,
                 'font-family': 'ui-sans-serif, system-ui, sans-serif'
             });
             label.textContent = d.displayDate;
@@ -1745,7 +1750,12 @@ function renderLineChart() {
     lineGroup.appendChild(path);
 
     // Dots and labels
-    const labelInterval = chartData.length > 50 ? 7 : chartData.length > 20 ? 3 : 1;
+    const maxLabels = Math.max(2, Math.floor(chartWidth / 50));
+    const hourlyLabelInterval = Math.max(1, Math.ceil(chartData.length / maxLabels));
+    const labelInterval = currentGranularity === 'hourly'
+        ? hourlyLabelInterval
+        : (chartData.length > 50 ? 7 : chartData.length > 20 ? 3 : 1);
+    const dotR = chartData.length > 120 ? 2.5 : chartData.length > 60 ? 3 : 4;
     chartData.forEach((d, i) => {
         const x = xScale(i);
         const y = margin.top + yScale(d.usage);
@@ -1754,7 +1764,7 @@ function renderLineChart() {
         const dot = createSVGElement('circle', {
             cx: x,
             cy: y,
-            r: 4,
+            r: dotR,
             fill: 'var(--SmartThemeBodyColor)',
             stroke: 'var(--SmartThemeInputColor)',
             'stroke-width': '2',
@@ -1762,14 +1772,14 @@ function renderLineChart() {
         });
 
         dot.addEventListener('mouseenter', () => {
-            dot.setAttribute('r', '6');
+            dot.setAttribute('r', String(dotR + 2));
             showTooltip(d);
         });
         dot.addEventListener('mousemove', (e) => {
             moveTooltip(e);
         });
         dot.addEventListener('mouseleave', () => {
-            dot.setAttribute('r', '4');
+            dot.setAttribute('r', String(dotR));
             hideTooltip();
         });
         dotGroup.appendChild(dot);
