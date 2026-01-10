@@ -30,3 +30,133 @@
 .model-config-row {
   padding: 2px 0;
 }
+
+/* ===== Compact Miniview Styles ===== */
+
+.token-usage-miniview {
+  position: fixed;
+  bottom: 80px;
+  right: 20px;
+  width: 180px;
+  background: rgba(30, 30, 40, 0.92);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.05) inset;
+  z-index: 9998;
+  font-family: inherit;
+  overflow: hidden;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.token-usage-miniview.pinned {
+  border-color: rgba(99, 102, 241, 0.4);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(99, 102, 241, 0.2) inset;
+}
+
+.miniview-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.miniview-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--SmartThemeBodyColor, #e5e5e5);
+  opacity: 0.9;
+}
+
+.miniview-controls {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.miniview-controls button {
+  background: transparent;
+  border: none;
+  color: var(--SmartThemeBodyColor, #e5e5e5);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  opacity: 0.6;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.miniview-controls button:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.miniview-mode-btn {
+  font-size: 9px !important;
+  padding: 3px 8px !important;
+  background: rgba(255, 255, 255, 0.08) !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+}
+
+.miniview-mode-btn:hover {
+  background: rgba(255, 255, 255, 0.15) !important;
+}
+
+.miniview-pin-btn.active {
+  opacity: 1;
+  color: #6366f1;
+}
+
+.miniview-close-btn {
+  font-size: 14px !important;
+  line-height: 1;
+  padding: 0 4px !important;
+}
+
+.miniview-body {
+  padding: 10px;
+}
+
+.miniview-stat-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 3px 0;
+}
+
+.miniview-stat-row:first-child {
+  padding-bottom: 6px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.miniview-stat-label {
+  font-size: 10px;
+  color: var(--SmartThemeBodyColor, #e5e5e5);
+  opacity: 0.5;
+}
+
+.miniview-stat-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--SmartThemeBodyColor, #e5e5e5);
+}
+
+.miniview-stat-secondary .miniview-stat-value {
+  font-size: 10px;
+  font-weight: 500;
+  opacity: 0.8;
+}
+
+.miniview-stat-cost {
+  margin-top: 4px;
+  padding-top: 6px !important;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.miniview-stat-cost .miniview-stat-value {
+  color: #10b981;
+}

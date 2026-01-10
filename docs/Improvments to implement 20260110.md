@@ -7,7 +7,7 @@ Chart
 
 Data
 - Ability to import and export data
-- Add compact miniview that can be pinned with session, hourly and daily data toggles
+- ~~Add compact miniview that can be pinned with session, hourly and daily data toggles~~ ✅
 - Add a per chat usage view
 
 Slash commands

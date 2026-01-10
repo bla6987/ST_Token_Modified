@@ -114,6 +114,11 @@ const defaultSettings = {
     modelColors: {}, // { "gpt-4o": "#6366f1", "claude-3-opus": "#8b5cf6", ... }
     // Prices per 1M tokens: { "gpt-4o": { in: 2.5, out: 10 }, ... }
     modelPrices: {},
+    // Miniview settings
+    miniview: {
+        pinned: false,
+        mode: 'session', // 'session', 'hourly', 'daily'
+    },
     // Accumulated usage data
     usage: {
         session: { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, startTime: null },
@@ -1033,6 +1038,18 @@ function registerSlashCommands() {
             }),
         ],
     }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'tokenmini',
+        callback: () => {
+            toggleMiniview();
+            const settings = getSettings();
+            const isVisible = miniviewElement && $(miniviewElement).is(':visible');
+            return isVisible ? 'Miniview shown.' : 'Miniview hidden.';
+        },
+        returns: 'Miniview toggle status',
+        helpString: 'Toggles the compact miniview panel showing session/hourly/daily token usage.',
+    }));
 }
 
 /**
@@ -1327,6 +1344,9 @@ let currentChartType = 'bar'; // 'bar' or 'line'
 let currentGranularity = 'daily'; // 'daily' or 'hourly'
 let chartData = [];
 let tooltip = null;
+
+// Miniview state
+let miniviewElement = null;
 
 // Health check state
 let lastRecordedTimestamp = null;
@@ -2163,6 +2183,9 @@ function updateUIStats() {
 
     // Update health indicator
     updateHealthIndicator();
+
+    // Update miniview if visible
+    updateMiniviewStats();
 }
 
 
@@ -2218,6 +2241,230 @@ function updateChatUsageDisplay() {
     $('#token-usage-chat-input').text(formatTokens(chatUsage.input));
     $('#token-usage-chat-output').text(formatTokens(chatUsage.output));
     $('#token-usage-chat-id').text(`Chat: ${chatId}`);
+}
+
+
+/**
+ * Create the floating compact miniview
+ */
+function createMiniview() {
+    if (miniviewElement) return; // Already created
+
+    const settings = getSettings();
+    const stats = getUsageStats();
+    const isPinned = settings.miniview?.pinned || false;
+    const mode = settings.miniview?.mode || 'session';
+
+    const html = `
+        <div id="token-usage-miniview" class="token-usage-miniview ${isPinned ? 'pinned' : ''}" style="display: ${isPinned ? 'block' : 'none'};">
+            <div class="miniview-header">
+                <span class="miniview-title">📊 Tokens</span>
+                <div class="miniview-controls">
+                    <button class="miniview-mode-btn" title="Toggle data view (Session/Hourly/Daily)">
+                        <span class="miniview-mode-label">${mode.charAt(0).toUpperCase() + mode.slice(1)}</span>
+                    </button>
+                    <button class="miniview-pin-btn ${isPinned ? 'active' : ''}" title="${isPinned ? 'Unpin miniview' : 'Pin miniview'}">
+                        📌
+                    </button>
+                    <button class="miniview-close-btn" title="Close miniview">×</button>
+                </div>
+            </div>
+            <div class="miniview-body">
+                <div class="miniview-stat-row">
+                    <span class="miniview-stat-label">Total</span>
+                    <span class="miniview-stat-value" id="miniview-total">0</span>
+                </div>
+                <div class="miniview-stat-row miniview-stat-secondary">
+                    <span class="miniview-stat-label">In/Out</span>
+                    <span class="miniview-stat-value">
+                        <span id="miniview-input">0</span> / <span id="miniview-output">0</span>
+                    </span>
+                </div>
+                <div class="miniview-stat-row miniview-stat-secondary">
+                    <span class="miniview-stat-label">🧠 Reasoning</span>
+                    <span class="miniview-stat-value" id="miniview-reasoning">0</span>
+                </div>
+                <div class="miniview-stat-row miniview-stat-secondary">
+                    <span class="miniview-stat-label">Messages</span>
+                    <span class="miniview-stat-value" id="miniview-messages">0</span>
+                </div>
+                <div class="miniview-stat-row miniview-stat-cost">
+                    <span class="miniview-stat-label">Cost</span>
+                    <span class="miniview-stat-value" id="miniview-cost">$0.00</span>
+                </div>
+            </div>
+        </div>
+    `;
+
+    // Append to body for proper positioning
+    $('body').append(html);
+    miniviewElement = document.getElementById('token-usage-miniview');
+
+    // Event handlers
+    $('.miniview-pin-btn').on('click', toggleMiniviewPin);
+    $('.miniview-close-btn').on('click', hideMiniview);
+    $('.miniview-mode-btn').on('click', cycleMiniviewMode);
+
+    // Initial update
+    updateMiniviewStats();
+}
+
+/**
+ * Show the miniview
+ */
+function showMiniview() {
+    if (!miniviewElement) {
+        createMiniview();
+    }
+    $(miniviewElement).fadeIn(150);
+}
+
+/**
+ * Hide the miniview
+ */
+function hideMiniview() {
+    if (miniviewElement) {
+        $(miniviewElement).fadeOut(150);
+        // If it was pinned, unpin it
+        const settings = getSettings();
+        if (settings.miniview?.pinned) {
+            settings.miniview.pinned = false;
+            saveSettings();
+            $('.miniview-pin-btn').removeClass('active');
+        }
+    }
+}
+
+/**
+ * Toggle miniview visibility
+ */
+function toggleMiniview() {
+    if (!miniviewElement) {
+        createMiniview();
+        showMiniview();
+    } else if ($(miniviewElement).is(':visible')) {
+        hideMiniview();
+    } else {
+        showMiniview();
+    }
+}
+
+/**
+ * Toggle pin state of the miniview
+ */
+function toggleMiniviewPin() {
+    const settings = getSettings();
+    if (!settings.miniview) {
+        settings.miniview = { pinned: false, mode: 'session' };
+    }
+    settings.miniview.pinned = !settings.miniview.pinned;
+    saveSettings();
+
+    const $btn = $('.miniview-pin-btn');
+    if (settings.miniview.pinned) {
+        $btn.addClass('active');
+        $btn.attr('title', 'Unpin miniview');
+    } else {
+        $btn.removeClass('active');
+        $btn.attr('title', 'Pin miniview');
+    }
+
+    $(miniviewElement).toggleClass('pinned', settings.miniview.pinned);
+}
+
+/**
+ * Cycle through miniview data modes: session → hourly → daily → session
+ */
+function cycleMiniviewMode() {
+    const settings = getSettings();
+    if (!settings.miniview) {
+        settings.miniview = { pinned: false, mode: 'session' };
+    }
+
+    const modes = ['session', 'hourly', 'daily'];
+    const currentIndex = modes.indexOf(settings.miniview.mode);
+    const nextIndex = (currentIndex + 1) % modes.length;
+    settings.miniview.mode = modes[nextIndex];
+    saveSettings();
+
+    // Update button label
+    $('.miniview-mode-label').text(settings.miniview.mode.charAt(0).toUpperCase() + settings.miniview.mode.slice(1));
+
+    // Refresh stats
+    updateMiniviewStats();
+}
+
+/**
+ * Update miniview stats based on current mode
+ */
+function updateMiniviewStats() {
+    if (!miniviewElement) return;
+
+    const settings = getSettings();
+    const mode = settings.miniview?.mode || 'session';
+    const stats = getUsageStats();
+    const now = getCurrentEasternTime();
+
+    let data;
+    let cost = 0;
+
+    switch (mode) {
+        case 'session':
+            data = stats.session;
+            // Calculate session cost (rough estimate using current model prices)
+            // For simplicity, use the ratio of session to allTime
+            if (stats.allTime.total > 0) {
+                const allTimeCost = calculateAllTimeCost();
+                cost = allTimeCost * (stats.session.total / stats.allTime.total);
+            }
+            break;
+
+        case 'hourly':
+            // Get current hour's data
+            const hourKey = getHourKey(now);
+            const hourData = settings.usage.byHour?.[hourKey] || { input: 0, output: 0, total: 0, reasoning: 0, messageCount: 0 };
+            data = {
+                input: hourData.input || 0,
+                output: hourData.output || 0,
+                total: hourData.total || 0,
+                reasoning: hourData.reasoning || 0,
+                messageCount: hourData.messageCount || 0
+            };
+            // Calculate hourly cost from models
+            if (hourData.models) {
+                for (const [mid, modelData] of Object.entries(hourData.models)) {
+                    const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
+                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                    cost += calculateCost(mInput, mOutput, mid);
+                }
+            }
+            break;
+
+        case 'daily':
+            data = stats.today;
+            // Calculate today's cost
+            const todayKey = getDayKey(now);
+            const dayData = settings.usage.byDay?.[todayKey];
+            if (dayData?.models) {
+                for (const [mid, modelData] of Object.entries(dayData.models)) {
+                    const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
+                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                    cost += calculateCost(mInput, mOutput, mid);
+                }
+            }
+            break;
+
+        default:
+            data = stats.session;
+    }
+
+    // Update DOM
+    $('#miniview-total').text(formatTokens(data.total || 0));
+    $('#miniview-input').text(formatTokens(data.input || 0));
+    $('#miniview-output').text(formatTokens(data.output || 0));
+    $('#miniview-reasoning').text(formatTokens(data.reasoning || 0));
+    $('#miniview-messages').text(data.messageCount || 0);
+    $('#miniview-cost').text(`$${cost.toFixed(2)}`);
 }
 
 
@@ -2301,6 +2548,7 @@ function createSettingsUI() {
                     <b>Token Usage Tracker</b>
                     <span id="token-usage-mini-counter" style="margin-left: 8px; font-size: 11px; color: var(--SmartThemeBodyColor); opacity: 0.75;" title="Today's total tokens">${formatTokens(stats.today.total)}</span>
                     <span id="token-usage-health-indicator" style="margin-left: 6px; font-size: 10px; cursor: help;" title="Extension health status">🟢</span>
+                    <button id="token-usage-miniview-toggle" class="menu_button" style="margin-left: 6px; padding: 2px 6px; font-size: 10px;" title="Toggle compact miniview">📊</button>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
@@ -2536,6 +2784,15 @@ function createSettingsUI() {
             toastr.success('All stats reset');
         }
     });
+
+    // Miniview toggle button handler
+    $('#token-usage-miniview-toggle').on('click', function (e) {
+        e.stopPropagation(); // Prevent triggering the drawer toggle
+        toggleMiniview();
+    });
+
+    // Create miniview (will show if pinned)
+    createMiniview();
 
     // Subscribe to updates
     eventSource.on('tokenUsageUpdated', updateUIStats);
