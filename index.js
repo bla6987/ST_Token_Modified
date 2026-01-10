@@ -118,6 +118,8 @@ const defaultSettings = {
     miniview: {
         pinned: false,
         mode: 'session', // 'session', 'hourly', 'daily'
+        position: { bottom: 80, right: 20 }, // Position in pixels
+        size: { width: 180, height: null }, // Size in pixels (null = auto height)
     },
     // Accumulated usage data
     usage: {
@@ -2293,6 +2295,7 @@ function createMiniview() {
                     <span class="miniview-stat-value" id="miniview-cost">$0.00</span>
                 </div>
             </div>
+            <div class="miniview-resize-handle" title="Drag to resize"></div>
         </div>
     `;
 
@@ -2304,6 +2307,16 @@ function createMiniview() {
     $('.miniview-pin-btn').on('click', toggleMiniviewPin);
     $('.miniview-close-btn').on('click', hideMiniview);
     $('.miniview-mode-btn').on('click', cycleMiniviewMode);
+
+    // Setup drag and drop
+    setupMiniviewDrag();
+
+    // Setup resize
+    setupMiniviewResize();
+
+    // Apply saved position and size
+    applyMiniviewPosition();
+    applyMiniviewSize();
 
     // Initial update
     updateMiniviewStats();
@@ -2392,6 +2405,223 @@ function cycleMiniviewMode() {
 
     // Refresh stats
     updateMiniviewStats();
+}
+
+/**
+ * Apply saved position to miniview
+ */
+function applyMiniviewPosition() {
+    if (!miniviewElement) return;
+
+    const settings = getSettings();
+    const position = settings.miniview?.position || { bottom: 80, right: 20 };
+
+    // Validate position is within viewport bounds
+    const rect = miniviewElement.getBoundingClientRect();
+    const maxBottom = window.innerHeight - rect.height - 10;
+    const maxRight = window.innerWidth - rect.width - 10;
+
+    const validBottom = Math.max(10, Math.min(position.bottom, maxBottom));
+    const validRight = Math.max(10, Math.min(position.right, maxRight));
+
+    miniviewElement.style.bottom = `${validBottom}px`;
+    miniviewElement.style.right = `${validRight}px`;
+    // Clear any top/left that might interfere
+    miniviewElement.style.top = 'auto';
+    miniviewElement.style.left = 'auto';
+}
+
+/**
+ * Setup drag and drop for miniview
+ */
+function setupMiniviewDrag() {
+    if (!miniviewElement) return;
+
+    const header = miniviewElement.querySelector('.miniview-header');
+    if (!header) return;
+
+    let isDragging = false;
+    let startX = 0;
+    let startY = 0;
+    let startBottom = 0;
+    let startRight = 0;
+
+    // Make header show it's draggable
+    header.style.cursor = 'grab';
+
+    const onMouseDown = (e) => {
+        // Don't start drag if clicking a button
+        if (e.target.closest('button')) return;
+
+        isDragging = true;
+        header.style.cursor = 'grabbing';
+
+        // Get starting mouse position
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        startX = clientX;
+        startY = clientY;
+
+        // Get current position from computed style
+        const style = window.getComputedStyle(miniviewElement);
+        startBottom = parseInt(style.bottom, 10) || 80;
+        startRight = parseInt(style.right, 10) || 20;
+
+        e.preventDefault();
+    };
+
+    const onMouseMove = (e) => {
+        if (!isDragging) return;
+
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+
+        // Calculate movement deltas (inverted because we're using bottom/right)
+        const deltaX = startX - clientX;
+        const deltaY = clientY - startY;
+
+        // Calculate new position
+        let newRight = startRight + deltaX;
+        let newBottom = startBottom - deltaY;
+
+        // Constrain to viewport
+        const rect = miniviewElement.getBoundingClientRect();
+        const maxRight = window.innerWidth - rect.width - 10;
+        const maxBottom = window.innerHeight - rect.height - 10;
+
+        newRight = Math.max(10, Math.min(newRight, maxRight));
+        newBottom = Math.max(10, Math.min(newBottom, maxBottom));
+
+        // Apply new position
+        miniviewElement.style.right = `${newRight}px`;
+        miniviewElement.style.bottom = `${newBottom}px`;
+    };
+
+    const onMouseUp = () => {
+        if (!isDragging) return;
+
+        isDragging = false;
+        header.style.cursor = 'grab';
+
+        // Save position to settings
+        const style = window.getComputedStyle(miniviewElement);
+        const settings = getSettings();
+        if (!settings.miniview) {
+            settings.miniview = { pinned: false, mode: 'session', position: {} };
+        }
+        if (!settings.miniview.position) {
+            settings.miniview.position = {};
+        }
+        settings.miniview.position.bottom = parseInt(style.bottom, 10) || 80;
+        settings.miniview.position.right = parseInt(style.right, 10) || 20;
+        saveSettings();
+    };
+
+    // Mouse events
+    header.addEventListener('mousedown', onMouseDown);
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+
+    // Touch events for mobile
+    header.addEventListener('touchstart', onMouseDown, { passive: false });
+    document.addEventListener('touchmove', onMouseMove, { passive: false });
+    document.addEventListener('touchend', onMouseUp);
+}
+
+/**
+ * Apply saved size to miniview
+ */
+function applyMiniviewSize() {
+    if (!miniviewElement) return;
+
+    const settings = getSettings();
+    const size = settings.miniview?.size || { width: 180, height: null };
+
+    if (size.width) {
+        miniviewElement.style.width = `${size.width}px`;
+    }
+    if (size.height) {
+        miniviewElement.style.height = `${size.height}px`;
+    }
+}
+
+/**
+ * Setup resize functionality for miniview
+ */
+function setupMiniviewResize() {
+    if (!miniviewElement) return;
+
+    const handle = miniviewElement.querySelector('.miniview-resize-handle');
+    if (!handle) return;
+
+    let isResizing = false;
+    let startX = 0;
+    let startY = 0;
+    let startWidth = 0;
+    let startHeight = 0;
+
+    const onMouseDown = (e) => {
+        isResizing = true;
+
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        startX = clientX;
+        startY = clientY;
+
+        const rect = miniviewElement.getBoundingClientRect();
+        startWidth = rect.width;
+        startHeight = rect.height;
+
+        e.preventDefault();
+        e.stopPropagation();
+    };
+
+    const onMouseMove = (e) => {
+        if (!isResizing) return;
+
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+
+        // Since handle is bottom-left, dragging left increases width, dragging down increases height
+        const deltaX = startX - clientX;
+        const deltaY = clientY - startY;
+
+        // Calculate new size with constraints
+        const newWidth = Math.max(140, Math.min(startWidth + deltaX, 400));
+        const newHeight = Math.max(100, Math.min(startHeight + deltaY, 500));
+
+        miniviewElement.style.width = `${newWidth}px`;
+        miniviewElement.style.height = `${newHeight}px`;
+    };
+
+    const onMouseUp = () => {
+        if (!isResizing) return;
+
+        isResizing = false;
+
+        // Save size to settings
+        const rect = miniviewElement.getBoundingClientRect();
+        const settings = getSettings();
+        if (!settings.miniview) {
+            settings.miniview = { pinned: false, mode: 'session', position: {}, size: {} };
+        }
+        if (!settings.miniview.size) {
+            settings.miniview.size = {};
+        }
+        settings.miniview.size.width = Math.round(rect.width);
+        settings.miniview.size.height = Math.round(rect.height);
+        saveSettings();
+    };
+
+    // Mouse events
+    handle.addEventListener('mousedown', onMouseDown);
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+
+    // Touch events for mobile
+    handle.addEventListener('touchstart', onMouseDown, { passive: false });
+    document.addEventListener('touchmove', onMouseMove, { passive: false });
+    document.addEventListener('touchend', onMouseUp);
 }
 
 /**
