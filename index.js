@@ -506,6 +506,16 @@ function getChatUsage(chatId) {
     return settings.usage.byChat[chatId] || { input: 0, output: 0, total: 0, messageCount: 0 };
 }
 
+function getCurrentChatId() {
+    const context = getContext();
+    return context?.chatMetadata?.chat_id
+        ?? context?.chatMetadata?.chatId
+        ?? context?.chat_id
+        ?? context?.chatId
+        ?? context?.currentChatId
+        ?? null;
+}
+
 /** @type {Promise<number>|null} Promise that resolves to input token count - started early, awaited later */
 let pendingInputTokensPromise = null;
 let pendingModelId = null;
@@ -755,8 +765,7 @@ async function handleMessageReceived(messageIndex, type) {
         pendingModelId = null;
         pendingSourceId = null;
 
-        // Get current chat ID if available
-        const chatId = context.chatMetadata?.chat_id || null;
+        const chatId = getCurrentChatId();
 
         recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId, reasoningTokens);
 
@@ -803,9 +812,7 @@ async function handleGenerationStopped() {
         pendingSourceId = null;
         preContinueTokenCount = 0; // Reset continue state too
 
-        // Get current chat ID if available
-        const context = getContext();
-        const chatId = context.chatMetadata?.chat_id || null;
+        const chatId = getCurrentChatId();
 
         // Record the usage - input tokens were sent even if generation was stopped
         recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId);
@@ -858,9 +865,7 @@ async function handleImpersonateReady(text) {
             outputTokens = await countTokens(text);
         }
 
-        // Get current chat ID if available
-        const context = getContext();
-        const chatId = context.chatMetadata?.chat_id || null;
+        const chatId = getCurrentChatId();
 
         recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId);
 
@@ -959,8 +964,7 @@ function registerSlashCommands() {
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'tokenchat',
         callback: async () => {
-            const context = getContext();
-            const chatId = context.chatMetadata?.chat_id;
+            const chatId = getCurrentChatId();
 
             if (!chatId) {
                 return 'No active chat found.';
@@ -2069,6 +2073,7 @@ function updateUIStats() {
     $('#token-usage-today-in').text(formatTokens(stats.today.input || 0));
     $('#token-usage-today-out').text(formatTokens(stats.today.output || 0));
     $('#token-usage-today-reasoning').text(formatTokens(stats.today.reasoning || 0));
+    $('#token-usage-mini-counter').text(formatTokens(stats.today.total));
 
     // Stats grid
     $('#token-usage-week-total').text(formatTokens(stats.thisWeek.total));
@@ -2195,8 +2200,7 @@ function updateHealthIndicator() {
  * Update the current chat usage display
  */
 function updateChatUsageDisplay() {
-    const context = getContext();
-    const chatId = context.chatMetadata?.chat_id;
+    const chatId = getCurrentChatId();
 
     if (!chatId) {
         $('#token-usage-chat-total').text('0');
@@ -2295,6 +2299,7 @@ function createSettingsUI() {
             <div class="inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header">
                     <b>Token Usage Tracker</b>
+                    <span id="token-usage-mini-counter" style="margin-left: 8px; font-size: 11px; color: var(--SmartThemeBodyColor); opacity: 0.75;" title="Today's total tokens">${formatTokens(stats.today.total)}</span>
                     <span id="token-usage-health-indicator" style="margin-left: 6px; font-size: 10px; cursor: help;" title="Extension health status">🟢</span>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
@@ -2534,6 +2539,8 @@ function createSettingsUI() {
 
     // Subscribe to updates
     eventSource.on('tokenUsageUpdated', updateUIStats);
+
+    setTimeout(updateUIStats, 0);
 
     // Handle container resize with ResizeObserver (handles panel width changes)
     const chartContainer = document.getElementById('token-usage-chart');
