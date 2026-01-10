@@ -195,9 +195,14 @@ function getCurrentModelId() {
 
 /**
  * Get the current source ID (API type)
- * @returns {string} Source identifier (openai, textgenerationwebui, novel, kobold, etc.)
+ * For OpenAI-compatible APIs, returns the specific chat_completion_source (e.g., 'openai', 'custom', 'windowai', etc.)
+ * @returns {string} Source identifier
  */
 function getCurrentSourceId() {
+    // For OpenAI API, get the specific chat completion source (openai, custom, claude, etc.)
+    if (main_api === 'openai' && oai_settings?.chat_completion_source) {
+        return oai_settings.chat_completion_source;
+    }
     return main_api || 'unknown';
 }
 
@@ -1906,6 +1911,14 @@ function getAvailableSources() {
 function formatSourceName(sourceId) {
     const names = {
         'openai': 'OpenAI',
+        'custom': 'Custom (OpenAI-compatible)',
+        'claude': 'Claude',
+        'windowai': 'Window AI',
+        'openrouter': 'OpenRouter',
+        'ai21': 'AI21',
+        'mistralai': 'Mistral AI',
+        'makersuite': 'Google AI',
+        'groq': 'Groq',
         'textgenerationwebui': 'Text Gen WebUI',
         'novel': 'NovelAI',
         'kobold': 'KoboldAI',
