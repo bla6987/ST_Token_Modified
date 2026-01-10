@@ -1,0 +1,4 @@
+Issues 2026-01-10
+- There is no 1D view to see only the usage for today in the chart
+- When switching to hourly view the bar chart displays only clear with no coloring
+- Track thinking vs response tokens

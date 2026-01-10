@@ -25,8 +25,8 @@ const defaultSettings = {
     modelPrices: {},
     // Accumulated usage data
     usage: {
-        session: { input: 0, output: 0, total: 0, messageCount: 0, startTime: null },
-        allTime: { input: 0, output: 0, total: 0, messageCount: 0 },
+        session: { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, startTime: null },
+        allTime: { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0 },
         // Time-based buckets: { "2025-01-15": { input: X, output: Y, total: Z, models: { "gpt-4o": 500, ... } }, ... }
         byDay: {},
         byHour: {},    // "2025-01-15T14": { ... }
@@ -209,20 +209,22 @@ function getCurrentSourceId() {
 /**
  * Record token usage into all relevant buckets
  * @param {number} inputTokens - Tokens in the user message
- * @param {number} outputTokens - Tokens in the AI response
+ * @param {number} outputTokens - Tokens in the AI response (excluding reasoning)
  * @param {string} [chatId] - Optional chat ID for per-chat tracking
  * @param {string} [modelId] - Optional model ID for per-model tracking
- * @param {string} [sourceId] - Optional source ID for per-source tracking (openai, textgenerationwebui, etc.)
+ * @param {string} [sourceId] - Optional source ID for per-source tracking
+ * @param {number} [reasoningTokens] - Optional reasoning/thinking tokens (Claude, o1, etc.)
  */
-function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, sourceId = null) {
+function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, sourceId = null, reasoningTokens = 0) {
     const settings = getSettings();
     const usage = settings.usage;
     const now = new Date();
-    const totalTokens = inputTokens + outputTokens;
+    const totalTokens = inputTokens + outputTokens + reasoningTokens;
 
     const addTokens = (bucket) => {
         bucket.input = (bucket.input || 0) + inputTokens;
         bucket.output = (bucket.output || 0) + outputTokens;
+        bucket.reasoning = (bucket.reasoning || 0) + reasoningTokens;
         bucket.total = (bucket.total || 0) + totalTokens;
         bucket.messageCount = (bucket.messageCount || 0) + 1;
     };
@@ -623,23 +625,28 @@ async function handleMessageReceived(messageIndex, type) {
         if (!message || !message.mes) return;
 
         let outputTokens;
+        let reasoningTokens = 0;
+
+        // Count reasoning/thinking tokens separately (from Claude thinking, OpenAI o1, etc.)
+        if (message.extra?.reasoning) {
+            reasoningTokens = await countTokens(message.extra.reasoning);
+            console.log(`[Token Usage Tracker] Counted ${reasoningTokens} reasoning/thinking tokens`);
+        }
 
         // Use SillyTavern's pre-calculated token count if available
-        // This already includes reasoning tokens when power_user.message_token_count_enabled is true
+        // Note: This may include reasoning tokens, so we subtract them to get just response tokens
         if (message.extra?.token_count && typeof message.extra.token_count === 'number') {
             outputTokens = message.extra.token_count;
-            console.log(`[Token Usage Tracker] Using pre-calculated token count: ${outputTokens}`);
-        } else {
-            // Fall back to manual counting
-            outputTokens = await countTokens(message.mes);
-
-            // Also count reasoning/thinking tokens (from Claude thinking, OpenAI o1, etc.)
-            if (message.extra?.reasoning) {
-                const reasoningTokens = await countTokens(message.extra.reasoning);
-                outputTokens += reasoningTokens;
-                console.log(`[Token Usage Tracker] Including ${reasoningTokens} reasoning tokens`);
+            // If reasoning tokens exist and are included in token_count, subtract them
+            // We track them separately for more accurate breakdown
+            if (reasoningTokens > 0 && message.extra.token_count > reasoningTokens) {
+                outputTokens = message.extra.token_count - reasoningTokens;
             }
-            console.log(`[Token Usage Tracker] Manually counted tokens: ${outputTokens}`);
+            console.log(`[Token Usage Tracker] Token count: ${outputTokens} response + ${reasoningTokens} reasoning`);
+        } else {
+            // Fall back to manual counting (just the message, not reasoning)
+            outputTokens = await countTokens(message.mes);
+            console.log(`[Token Usage Tracker] Manually counted: ${outputTokens} response + ${reasoningTokens} reasoning`);
         }
 
         // For 'continue' type, we only want the newly generated tokens, not the full message
@@ -665,9 +672,9 @@ async function handleMessageReceived(messageIndex, type) {
         // Get current chat ID if available
         const chatId = context.chatMetadata?.chat_id || null;
 
-        recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId);
+        recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId, reasoningTokens);
 
-        console.log(`[Token Usage Tracker] Recorded exchange: ${inputTokens} in, ${outputTokens} out, model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'}${savedPreContinueCount > 0 ? ' (continue delta)' : ''}`);
+        console.log(`[Token Usage Tracker] Recorded exchange: ${inputTokens} in, ${outputTokens} out, ${reasoningTokens} reasoning, model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'}${savedPreContinueCount > 0 ? ' (continue delta)' : ''}`);
     } catch (error) {
         console.error('[Token Usage Tracker] Error counting output tokens:', error);
     }
@@ -1397,8 +1404,8 @@ function getHourlyChartData(hours, sourceFilter = 'all') {
  */
 function getChartDataForGranularity() {
     if (currentGranularity === 'hourly') {
-        // Map range days to hours: 7D = 24h, 30D = 24*7h = 168h, 90D = 24*30h = 720h
-        const hoursMap = { 7: 24, 30: 168, 90: 720 };
+        // Map range days to hours: 1D = 24h, 7D = 24*3h = 72h (every 3 hours for a week), 30D = 24*7h = 168h, 90D = 24*14h = 336h
+        const hoursMap = { 1: 24, 7: 72, 30: 168, 90: 336 };
         const hours = hoursMap[currentChartRange] || 24;
         return getHourlyChartData(hours, currentSourceFilter);
     }
@@ -1967,6 +1974,7 @@ function updateUIStats() {
     $('#token-usage-today-total').text(formatTokens(stats.today.total));
     $('#token-usage-today-in').text(formatTokens(stats.today.input || 0));
     $('#token-usage-today-out').text(formatTokens(stats.today.output || 0));
+    $('#token-usage-today-reasoning').text(formatTokens(stats.today.reasoning || 0));
 
     // Stats grid
     $('#token-usage-week-total').text(formatTokens(stats.thisWeek.total));
@@ -2207,7 +2215,8 @@ function createSettingsUI() {
                             </div>
                             <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;">
                                 <span id="token-usage-today-in">${formatTokens(stats.today.input || 0)}</span> in /
-                                <span id="token-usage-today-out">${formatTokens(stats.today.output || 0)}</span> out
+                                <span id="token-usage-today-out">${formatTokens(stats.today.output || 0)}</span> out /
+                                <span id="token-usage-today-reasoning">${formatTokens(stats.today.reasoning || 0)}</span> 🧠
                             </div>
                         </div>
                         <div style="display: flex; align-items: center; gap: 6px;">
@@ -2215,6 +2224,7 @@ function createSettingsUI() {
                                 <option value="all">All Sources</option>
                             </select>
                             <div style="display: inline-flex; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; padding: 2px;">
+                                <button class="token-usage-range-btn menu_button" data-value="1" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">1D</button>
                                 <button class="token-usage-range-btn menu_button" data-value="7" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">7D</button>
                                 <button class="token-usage-range-btn menu_button active" data-value="30" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">30D</button>
                                 <button class="token-usage-range-btn menu_button" data-value="90" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">90D</button>
