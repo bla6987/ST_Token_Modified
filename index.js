@@ -36,6 +36,8 @@ const defaultSettings = {
         byChat: {},
         // Per-model usage: { "gpt-4o": { input: X, output: Y, total: Z, messageCount: N }, ... }
         byModel: {},
+        // Per-source usage: { "openai": { input: X, output: Y, total: Z, messageCount: N }, ... }
+        bySource: {},
     },
 };
 
@@ -59,6 +61,7 @@ function loadSettings() {
     if (!settings.usage.byMonth) settings.usage.byMonth = {};
     if (!settings.usage.byChat) settings.usage.byChat = {};
     if (!settings.usage.byModel) settings.usage.byModel = {};
+    if (!settings.usage.bySource) settings.usage.bySource = {};
 
     // Initialize modelPrices
     if (!settings.modelPrices) settings.modelPrices = {};
@@ -202,13 +205,22 @@ function getCurrentModelId() {
 }
 
 /**
+ * Get the current source ID (API type)
+ * @returns {string} Source identifier (openai, textgenerationwebui, novel, kobold, etc.)
+ */
+function getCurrentSourceId() {
+    return main_api || 'unknown';
+}
+
+/**
  * Record token usage into all relevant buckets
  * @param {number} inputTokens - Tokens in the user message
  * @param {number} outputTokens - Tokens in the AI response
  * @param {string} [chatId] - Optional chat ID for per-chat tracking
  * @param {string} [modelId] - Optional model ID for per-model tracking
+ * @param {string} [sourceId] - Optional source ID for per-source tracking (openai, textgenerationwebui, etc.)
  */
-function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null) {
+function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, sourceId = null) {
     const settings = getSettings();
     const usage = settings.usage;
     const now = new Date();
@@ -229,7 +241,7 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null) {
 
     // By day
     const dayKey = getDayKey(now);
-    if (!usage.byDay[dayKey]) usage.byDay[dayKey] = { input: 0, output: 0, total: 0, messageCount: 0, models: {} };
+    if (!usage.byDay[dayKey]) usage.byDay[dayKey] = { input: 0, output: 0, total: 0, messageCount: 0, models: {}, sources: {} };
     addTokens(usage.byDay[dayKey]);
 
     // Track model within day for stacked chart (with input/output breakdown for cost calculation)
@@ -242,6 +254,29 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null) {
         modelData.input += inputTokens;
         modelData.output += outputTokens;
         modelData.total += totalTokens;
+    }
+
+    // Track source within day for filtering
+    if (sourceId) {
+        if (!usage.byDay[dayKey].sources) usage.byDay[dayKey].sources = {};
+        if (!usage.byDay[dayKey].sources[sourceId]) {
+            usage.byDay[dayKey].sources[sourceId] = { input: 0, output: 0, total: 0, models: {} };
+        }
+        const sourceData = usage.byDay[dayKey].sources[sourceId];
+        sourceData.input += inputTokens;
+        sourceData.output += outputTokens;
+        sourceData.total += totalTokens;
+
+        // Also track model within source for the day (for filtered chart stacking)
+        if (modelId) {
+            if (!sourceData.models) sourceData.models = {};
+            if (!sourceData.models[modelId]) {
+                sourceData.models[modelId] = { input: 0, output: 0, total: 0 };
+            }
+            sourceData.models[modelId].input += inputTokens;
+            sourceData.models[modelId].output += outputTokens;
+            sourceData.models[modelId].total += totalTokens;
+        }
     }
 
     // By hour
@@ -271,12 +306,18 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null) {
         addTokens(usage.byModel[modelId]);
     }
 
+    // By source (aggregate)
+    if (sourceId) {
+        if (!usage.bySource[sourceId]) usage.bySource[sourceId] = { input: 0, output: 0, total: 0, messageCount: 0 };
+        addTokens(usage.bySource[sourceId]);
+    }
+
     saveSettings();
 
     // Emit custom event for UI updates
     eventSource.emit('tokenUsageUpdated', getUsageStats());
 
-    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${outputTokens} output, model: ${modelId || 'unknown'} (using ${getFriendlyTokenizerName(main_api).tokenizerName})`);
+    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${outputTokens} output, model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'} (using ${getFriendlyTokenizerName(main_api).tokenizerName})`);
 }
 
 /**
@@ -383,6 +424,7 @@ function getChatUsage(chatId) {
 /** @type {Promise<number>|null} Promise that resolves to input token count - started early, awaited later */
 let pendingInputTokensPromise = null;
 let pendingModelId = null;
+let pendingSourceId = null;
 // For 'continue' type generations, track the pre-continue token count so we can compute the delta
 let preContinueTokenCount = 0;
 
@@ -481,13 +523,14 @@ function handleGenerateAfterData(generate_data, dryRun) {
     // Don't count dry runs - they're just for token estimation, not actual API calls
     if (dryRun) return;
 
-    // Capture model ID synchronously (fast)
+    // Capture model ID and source ID synchronously (fast)
     pendingModelId = getCurrentModelId();
+    pendingSourceId = getCurrentSourceId();
 
     // Start token counting but DON'T await - let it run in parallel with the API request
     pendingInputTokensPromise = countInputTokens(generate_data)
         .then(count => {
-            console.log(`[Token Usage Tracker] Input tokens (full context): ${count}, model: ${pendingModelId}`);
+            console.log(`[Token Usage Tracker] Input tokens (full context): ${count}, model: ${pendingModelId}, source: ${pendingSourceId}`);
             return count;
         })
         .catch(error => {
@@ -507,7 +550,7 @@ function handleGenerateAfterData(generate_data, dryRun) {
 let isQuietGeneration = false;
 let isImpersonateGeneration = false;
 
-async function handleGenerationStarted(type, params, isDryRun) {
+function handleGenerationStarted(type, params, isDryRun) {
     if (isDryRun) return;
 
     // Track the generation type for special handling
@@ -518,22 +561,31 @@ async function handleGenerationStarted(type, params, isDryRun) {
     preContinueTokenCount = 0;
 
     // For continue type, capture the current message's token count
+    // IMPORTANT: Do NOT await here - this handler must be non-blocking to avoid freezing the UI
     if (type === 'continue') {
         try {
             const context = getContext();
             const lastMessage = context.chat[context.chat.length - 1];
 
             if (lastMessage) {
-                // Use existing token count if available
+                // Use existing token count if available (synchronous - fast path)
                 if (lastMessage.extra?.token_count && typeof lastMessage.extra.token_count === 'number') {
                     preContinueTokenCount = lastMessage.extra.token_count;
                 } else {
-                    // Calculate it ourselves
-                    let tokens = await countTokens(lastMessage.mes || '');
-                    if (lastMessage.extra?.reasoning) {
-                        tokens += await countTokens(lastMessage.extra.reasoning);
-                    }
-                    preContinueTokenCount = tokens;
+                    // Calculate it ourselves - schedule async but don't block
+                    // We use a promise to capture the count before message handling needs it
+                    (async () => {
+                        try {
+                            let tokens = await countTokens(lastMessage.mes || '');
+                            if (lastMessage.extra?.reasoning) {
+                                tokens += await countTokens(lastMessage.extra.reasoning);
+                            }
+                            preContinueTokenCount = tokens;
+                        } catch (error) {
+                            console.error('[Token Usage Tracker] Error calculating pre-continue tokens:', error);
+                            preContinueTokenCount = 0;
+                        }
+                    })();
                 }
             }
         } catch (error) {
@@ -608,15 +660,17 @@ async function handleMessageReceived(messageIndex, type) {
         // Await the input token counting that was started in handleGenerateAfterData
         const inputTokens = await pendingInputTokensPromise;
         const modelId = pendingModelId;
+        const sourceId = pendingSourceId;
         pendingInputTokensPromise = null;
         pendingModelId = null;
+        pendingSourceId = null;
 
         // Get current chat ID if available
         const chatId = context.chatMetadata?.chat_id || null;
 
-        recordUsage(inputTokens, outputTokens, chatId, modelId);
+        recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId);
 
-        console.log(`[Token Usage Tracker] Recorded exchange: ${inputTokens} in, ${outputTokens} out, model: ${modelId || 'unknown'}${savedPreContinueCount > 0 ? ' (continue delta)' : ''}`);
+        console.log(`[Token Usage Tracker] Recorded exchange: ${inputTokens} in, ${outputTokens} out, model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'}${savedPreContinueCount > 0 ? ' (continue delta)' : ''}`);
     } catch (error) {
         console.error('[Token Usage Tracker] Error counting output tokens:', error);
     }
@@ -653,8 +707,10 @@ async function handleGenerationStopped() {
         // Await the input token counting that was started in handleGenerateAfterData
         const inputTokens = await pendingInputTokensPromise;
         const modelId = pendingModelId;
+        const sourceId = pendingSourceId;
         pendingInputTokensPromise = null;
         pendingModelId = null;
+        pendingSourceId = null;
         preContinueTokenCount = 0; // Reset continue state too
 
         // Get current chat ID if available
@@ -662,9 +718,9 @@ async function handleGenerationStopped() {
         const chatId = context.chatMetadata?.chat_id || null;
 
         // Record the usage - input tokens were sent even if generation was stopped
-        recordUsage(inputTokens, outputTokens, chatId, modelId);
+        recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId);
 
-        console.log(`[Token Usage Tracker] Recorded stopped generation: ${inputTokens} in, ${outputTokens} out (partial), model: ${modelId || 'unknown'}`);
+        console.log(`[Token Usage Tracker] Recorded stopped generation: ${inputTokens} in, ${outputTokens} out (partial), model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'}`);
     } catch (error) {
         console.error('[Token Usage Tracker] Error handling stopped generation:', error);
         // Reset pending tokens even on error to prevent double counting
@@ -680,6 +736,7 @@ function handleChatChanged(chatId) {
     // Reset pending tokens when chat changes to prevent cross-chat counting
     pendingInputTokensPromise = null;
     pendingModelId = null;
+    pendingSourceId = null;
     preContinueTokenCount = 0;
     isQuietGeneration = false;
     isImpersonateGeneration = false;
@@ -700,8 +757,10 @@ async function handleImpersonateReady(text) {
         // Await the input token counting that was started in handleGenerateAfterData
         const inputTokens = await pendingInputTokensPromise;
         const modelId = pendingModelId;
+        const sourceId = pendingSourceId;
         pendingInputTokensPromise = null;
         pendingModelId = null;
+        pendingSourceId = null;
 
         // Count output tokens from the impersonated text
         let outputTokens = 0;
@@ -713,7 +772,7 @@ async function handleImpersonateReady(text) {
         const context = getContext();
         const chatId = context.chatMetadata?.chat_id || null;
 
-        recordUsage(inputTokens, outputTokens, chatId, modelId);
+        recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId);
 
 
         // Reset impersonate state
@@ -722,6 +781,7 @@ async function handleImpersonateReady(text) {
         console.error('[Token Usage Tracker] Error handling impersonate ready:', error);
         pendingInputTokensPromise = null;
         pendingModelId = null;
+        pendingSourceId = null;
         isImpersonateGeneration = false;
     }
 }
@@ -943,6 +1003,7 @@ function calculateAllTimeCost() {
 
 // Chart state
 let currentChartRange = 30;
+let currentSourceFilter = 'all'; // 'all' or specific source ID like 'openai', 'textgenerationwebui'
 let chartData = [];
 let tooltip = null;
 
@@ -966,8 +1027,10 @@ function createSVGElement(type, attrs = {}) {
 
 /**
  * Get chart data from real usage stats
+ * @param {number} days - Number of days to include
+ * @param {string} sourceFilter - Source to filter by, or 'all' for combined
  */
-function getChartData(days) {
+function getChartData(days, sourceFilter = 'all') {
     const stats = getUsageStats();
     const byDay = stats.byDay || {};
     const data = [];
@@ -977,15 +1040,37 @@ function getChartData(days) {
         const date = new Date(today);
         date.setDate(date.getDate() - i);
         const dayKey = getDayKey(date);
-        const dayData = byDay[dayKey] || { total: 0, input: 0, output: 0, models: {} };
+        const dayData = byDay[dayKey] || { total: 0, input: 0, output: 0, models: {}, sources: {} };
+
+        // Filter by source if specified
+        let usage, input, output, models;
+        if (sourceFilter !== 'all' && dayData.sources && dayData.sources[sourceFilter]) {
+            const sourceData = dayData.sources[sourceFilter];
+            usage = sourceData.total || 0;
+            input = sourceData.input || 0;
+            output = sourceData.output || 0;
+            models = sourceData.models || {};
+        } else if (sourceFilter !== 'all') {
+            // Source filter specified but no data for this source on this day
+            usage = 0;
+            input = 0;
+            output = 0;
+            models = {};
+        } else {
+            // 'all' - use combined data
+            usage = dayData.total || 0;
+            input = dayData.input || 0;
+            output = dayData.output || 0;
+            models = dayData.models || {};
+        }
 
         data.push({
             date: date,
             dayKey: dayKey,
-            usage: dayData.total || 0,
-            input: dayData.input || 0,
-            output: dayData.output || 0,
-            models: dayData.models || {},
+            usage: usage,
+            input: input,
+            output: output,
+            models: models,
             displayDate: new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(date),
             fullDate: new Intl.DateTimeFormat('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }).format(date)
         });
@@ -1280,7 +1365,7 @@ function hideTooltip() {
 
 function updateChartRange(range) {
     currentChartRange = range;
-    chartData = getChartData(range);
+    chartData = getChartData(range, currentSourceFilter);
     renderChart();
 
     document.querySelectorAll('.token-usage-range-btn').forEach(btn => {
@@ -1291,6 +1376,68 @@ function updateChartRange(range) {
             btn.classList.remove('active');
         }
     });
+}
+
+/**
+ * Update source filter and refresh display
+ */
+function updateSourceFilter(sourceId) {
+    currentSourceFilter = sourceId;
+    chartData = getChartData(currentChartRange, currentSourceFilter);
+    renderChart();
+    updateUIStats();
+}
+
+/**
+ * Get list of sources that have recorded usage
+ */
+function getAvailableSources() {
+    const settings = getSettings();
+    const sources = Object.keys(settings.usage.bySource || {}).sort();
+    return sources;
+}
+
+/**
+ * Format source name for display (make it more readable)
+ */
+function formatSourceName(sourceId) {
+    const names = {
+        'openai': 'OpenAI',
+        'textgenerationwebui': 'Text Gen WebUI',
+        'novel': 'NovelAI',
+        'kobold': 'KoboldAI',
+        'horde': 'AI Horde',
+        'unknown': 'Unknown'
+    };
+    return names[sourceId] || sourceId;
+}
+
+/**
+ * Update the source dropdown options
+ */
+function updateSourceDropdown() {
+    const dropdown = $('#token-usage-source-filter');
+    if (dropdown.length === 0) return;
+
+    const sources = getAvailableSources();
+    const currentValue = dropdown.val();
+
+    // Rebuild options
+    dropdown.empty();
+    dropdown.append('<option value="all">All Sources</option>');
+
+    for (const source of sources) {
+        const displayName = formatSourceName(source);
+        dropdown.append(`<option value="${source}">${displayName}</option>`);
+    }
+
+    // Restore selection if still valid
+    if (currentValue && (currentValue === 'all' || sources.includes(currentValue))) {
+        dropdown.val(currentValue);
+    } else {
+        dropdown.val('all');
+        currentSourceFilter = 'all';
+    }
 }
 
 /**
@@ -1353,12 +1500,12 @@ function updateUIStats() {
         }
         // Month check
         if (getMonthKey(date) === currentMonthKey) {
-             if (data.models) {
-                 for (const [mid, modelData] of Object.entries(data.models)) {
-                     const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
-                     const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
-                     monthCost += calculateCost(mInput, mOutput, mid);
-                 }
+            if (data.models) {
+                for (const [mid, modelData] of Object.entries(data.models)) {
+                    const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
+                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                    monthCost += calculateCost(mInput, mOutput, mid);
+                }
             }
         }
     }
@@ -1369,9 +1516,12 @@ function updateUIStats() {
 
     $('#token-usage-tokenizer').text('Tokenizer: ' + (stats.tokenizer || 'Unknown'));
 
-    // Update chart data
-    chartData = getChartData(currentChartRange);
+    // Update chart data with current source filter
+    chartData = getChartData(currentChartRange, currentSourceFilter);
     renderChart();
+
+    // Update source dropdown options (in case new sources were added)
+    updateSourceDropdown();
 
     // Update model colors grid
     renderModelColorsGrid();
@@ -1419,7 +1569,7 @@ function renderModelColorsGrid() {
         `);
 
         // Color picker handler
-        row.find('.model-color-picker').on('change', function() {
+        row.find('.model-color-picker').on('change', function () {
             setModelColor(String($(this).data('model')), String($(this).val()));
             renderChart();
         });
@@ -1427,15 +1577,15 @@ function renderModelColorsGrid() {
         // Price input handlers with debounce
         let debounceTimer;
         const handlePriceChange = () => {
-             const mId = model; // closure
-             const pIn = row.find('.price-input-in').val();
-             const pOut = row.find('.price-input-out').val();
-             setModelPrice(mId, pIn, pOut);
-             // Trigger UI update to recalc costs
-             updateUIStats();
+            const mId = model; // closure
+            const pIn = row.find('.price-input-in').val();
+            const pOut = row.find('.price-input-out').val();
+            setModelPrice(mId, pIn, pOut);
+            // Trigger UI update to recalc costs
+            updateUIStats();
         };
 
-        row.find('input[type="number"]').on('input', function() {
+        row.find('input[type="number"]').on('input', function () {
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(handlePriceChange, 500);
         });
@@ -1459,7 +1609,7 @@ function createSettingsUI() {
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
-                    <!-- Chart Header: Today stats + Range selector -->
+                    <!-- Chart Header: Today stats + Range/Source selectors -->
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                         <div>
                             <div style="display: flex; align-items: baseline; gap: 6px;">
@@ -1472,10 +1622,15 @@ function createSettingsUI() {
                                 <span id="token-usage-today-out">${formatTokens(stats.today.output || 0)}</span> out
                             </div>
                         </div>
-                        <div style="display: inline-flex; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; padding: 2px;">
-                            <button class="token-usage-range-btn menu_button" data-value="7" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">7D</button>
-                            <button class="token-usage-range-btn menu_button active" data-value="30" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">30D</button>
-                            <button class="token-usage-range-btn menu_button" data-value="90" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">90D</button>
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <select id="token-usage-source-filter" style="padding: 4px 8px; font-size: 11px; border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); cursor: pointer;">
+                                <option value="all">All Sources</option>
+                            </select>
+                            <div style="display: inline-flex; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; padding: 2px;">
+                                <button class="token-usage-range-btn menu_button" data-value="7" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">7D</button>
+                                <button class="token-usage-range-btn menu_button active" data-value="30" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">30D</button>
+                                <button class="token-usage-range-btn menu_button" data-value="90" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">90D</button>
+                            </div>
                         </div>
                     </div>
 
@@ -1563,8 +1718,11 @@ function createSettingsUI() {
     tooltip = document.getElementById('token-usage-tooltip');
 
     // Initialize chart
-    chartData = getChartData(currentChartRange);
+    chartData = getChartData(currentChartRange, currentSourceFilter);
     setTimeout(renderChart, 100);
+
+    // Initialize source dropdown
+    updateSourceDropdown();
 
     // Range button handlers
     document.querySelectorAll('.token-usage-range-btn').forEach(btn => {
@@ -1573,7 +1731,12 @@ function createSettingsUI() {
         });
     });
 
-    $('#token-usage-reset-all').on('click', function() {
+    // Source filter dropdown handler
+    $('#token-usage-source-filter').on('change', function () {
+        updateSourceFilter($(this).val());
+    });
+
+    $('#token-usage-reset-all').on('click', function () {
         if (confirm('Are you sure you want to reset ALL token usage data? This cannot be undone.')) {
             resetAllUsage();
             updateUIStats();
@@ -1624,16 +1787,23 @@ function patchBackgroundGenerations() {
 function patchGenerateQuietPrompt() {
     // For quiet generations (Guided Generations, Summarize, Expressions, etc.),
     // MESSAGE_RECEIVED doesn't fire. Flush pending tokens on next generation or chat change.
-    eventSource.on(event_types.GENERATION_STARTED, async (type, params, dryRun) => {
+    // IMPORTANT: These handlers must be non-blocking to avoid freezing the UI
+    eventSource.on(event_types.GENERATION_STARTED, (type, params, dryRun) => {
         if (dryRun) return;
         if (isQuietGeneration && pendingInputTokensPromise) {
-            await flushQuietGeneration();
+            // Schedule flush but don't await - prevents blocking the generation
+            flushQuietGeneration().catch(e => {
+                console.error('[Token Usage Tracker] Error flushing quiet generation:', e);
+            });
         }
     });
 
-    eventSource.on(event_types.CHAT_CHANGED, async () => {
+    eventSource.on(event_types.CHAT_CHANGED, () => {
         if (isQuietGeneration && pendingInputTokensPromise) {
-            await flushQuietGeneration();
+            // Schedule flush but don't await - prevents blocking UI
+            flushQuietGeneration().catch(e => {
+                console.error('[Token Usage Tracker] Error flushing quiet generation on chat change:', e);
+            });
         }
     });
 }
@@ -1647,6 +1817,7 @@ async function flushQuietGeneration() {
     try {
         const inputTokens = await pendingInputTokensPromise;
         const modelId = pendingModelId;
+        const sourceId = pendingSourceId;
 
         // Try to get output from streaming processor
         let outputTokens = 0;
@@ -1656,7 +1827,7 @@ async function flushQuietGeneration() {
 
         // Record the usage
         if (inputTokens > 0 || outputTokens > 0) {
-            recordUsage(inputTokens, outputTokens, null, modelId);
+            recordUsage(inputTokens, outputTokens, null, modelId, sourceId);
         }
     } catch (e) {
         console.error('[Token Usage Tracker] Error flushing quiet generation:', e);
@@ -1664,6 +1835,7 @@ async function flushQuietGeneration() {
         // Reset state
         pendingInputTokensPromise = null;
         pendingModelId = null;
+        pendingSourceId = null;
         isQuietGeneration = false;
     }
 }
@@ -1683,13 +1855,14 @@ function patchConnectionManager() {
 
             const originalSendRequest = ServiceClass.sendRequest.bind(ServiceClass);
 
-            ServiceClass.sendRequest = async function(profileId, messages, maxTokens, custom, overridePayload) {
+            ServiceClass.sendRequest = async function (profileId, messages, maxTokens, custom, overridePayload) {
                 if (isTrackingBackground) {
                     return await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
                 }
 
                 let inputTokens = 0;
                 const modelId = getCurrentModelId();
+                const sourceId = getCurrentSourceId();
 
                 try {
                     isTrackingBackground = true;
@@ -1711,7 +1884,7 @@ function patchConnectionManager() {
                         }
 
                         if (outputTokens > 0 || inputTokens > 0) {
-                            recordUsage(inputTokens, outputTokens, null, modelId);
+                            recordUsage(inputTokens, outputTokens, null, modelId, sourceId);
                         }
                     } catch (e) {
                         console.error('[Token Usage Tracker] Error counting sendRequest output:', e);
@@ -1746,6 +1919,7 @@ async function handleBackgroundGeneration(originalFn, context, args, inputCounte
     let result;
     let inputTokens = 0;
     const modelId = getCurrentModelId();
+    const sourceId = getCurrentSourceId();
 
     try {
         isTrackingBackground = true;
@@ -1765,7 +1939,7 @@ async function handleBackgroundGeneration(originalFn, context, args, inputCounte
         try {
             const outputTokens = await outputCounter(result);
             if (outputTokens > 0 || inputTokens > 0) {
-                recordUsage(inputTokens, outputTokens, null, modelId);
+                recordUsage(inputTokens, outputTokens, null, modelId, sourceId);
                 console.log(`[Token Usage Tracker] Background usage recorded: ${inputTokens} in, ${outputTokens} out`);
             }
         } catch (e) {
