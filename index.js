@@ -12,6 +12,7 @@ import { extension_settings, getContext } from '../../../extensions.js';
 import { getTokenCountAsync, getFriendlyTokenizerName } from '../../../tokenizers.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
+import { SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
 import { getChatCompletionModel, oai_settings } from '../../../openai.js';
 import { textgenerationwebui_settings as textgen_settings } from '../../../textgen-settings.js';
 
@@ -24,8 +25,8 @@ const defaultSettings = {
     modelPrices: {},
     // Accumulated usage data
     usage: {
-        session: { input: 0, output: 0, total: 0, messageCount: 0, startTime: null },
-        allTime: { input: 0, output: 0, total: 0, messageCount: 0 },
+        session: { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, startTime: null },
+        allTime: { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0 },
         // Time-based buckets: { "2025-01-15": { input: X, output: Y, total: Z, models: { "gpt-4o": 500, ... } }, ... }
         byDay: {},
         byHour: {},    // "2025-01-15T14": { ... }
@@ -194,29 +195,36 @@ function getCurrentModelId() {
 
 /**
  * Get the current source ID (API type)
- * @returns {string} Source identifier (openai, textgenerationwebui, novel, kobold, etc.)
+ * For OpenAI-compatible APIs, returns the specific chat_completion_source (e.g., 'openai', 'custom', 'windowai', etc.)
+ * @returns {string} Source identifier
  */
 function getCurrentSourceId() {
+    // For OpenAI API, get the specific chat completion source (openai, custom, claude, etc.)
+    if (main_api === 'openai' && oai_settings?.chat_completion_source) {
+        return oai_settings.chat_completion_source;
+    }
     return main_api || 'unknown';
 }
 
 /**
  * Record token usage into all relevant buckets
  * @param {number} inputTokens - Tokens in the user message
- * @param {number} outputTokens - Tokens in the AI response
+ * @param {number} outputTokens - Tokens in the AI response (excluding reasoning)
  * @param {string} [chatId] - Optional chat ID for per-chat tracking
  * @param {string} [modelId] - Optional model ID for per-model tracking
- * @param {string} [sourceId] - Optional source ID for per-source tracking (openai, textgenerationwebui, etc.)
+ * @param {string} [sourceId] - Optional source ID for per-source tracking
+ * @param {number} [reasoningTokens] - Optional reasoning/thinking tokens (Claude, o1, etc.)
  */
-function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, sourceId = null) {
+function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, sourceId = null, reasoningTokens = 0) {
     const settings = getSettings();
     const usage = settings.usage;
     const now = new Date();
-    const totalTokens = inputTokens + outputTokens;
+    const totalTokens = inputTokens + outputTokens + reasoningTokens;
 
     const addTokens = (bucket) => {
         bucket.input = (bucket.input || 0) + inputTokens;
         bucket.output = (bucket.output || 0) + outputTokens;
+        bucket.reasoning = (bucket.reasoning || 0) + reasoningTokens;
         bucket.total = (bucket.total || 0) + totalTokens;
         bucket.messageCount = (bucket.messageCount || 0) + 1;
     };
@@ -301,6 +309,9 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, s
     }
 
     saveSettings();
+
+    // Update health tracking timestamp
+    lastRecordedTimestamp = new Date().toISOString();
 
     // Emit custom event for UI updates
     eventSource.emit('tokenUsageUpdated', getUsageStats());
@@ -614,23 +625,28 @@ async function handleMessageReceived(messageIndex, type) {
         if (!message || !message.mes) return;
 
         let outputTokens;
+        let reasoningTokens = 0;
+
+        // Count reasoning/thinking tokens separately (from Claude thinking, OpenAI o1, etc.)
+        if (message.extra?.reasoning) {
+            reasoningTokens = await countTokens(message.extra.reasoning);
+            console.log(`[Token Usage Tracker] Counted ${reasoningTokens} reasoning/thinking tokens`);
+        }
 
         // Use SillyTavern's pre-calculated token count if available
-        // This already includes reasoning tokens when power_user.message_token_count_enabled is true
+        // Note: This may include reasoning tokens, so we subtract them to get just response tokens
         if (message.extra?.token_count && typeof message.extra.token_count === 'number') {
             outputTokens = message.extra.token_count;
-            console.log(`[Token Usage Tracker] Using pre-calculated token count: ${outputTokens}`);
-        } else {
-            // Fall back to manual counting
-            outputTokens = await countTokens(message.mes);
-
-            // Also count reasoning/thinking tokens (from Claude thinking, OpenAI o1, etc.)
-            if (message.extra?.reasoning) {
-                const reasoningTokens = await countTokens(message.extra.reasoning);
-                outputTokens += reasoningTokens;
-                console.log(`[Token Usage Tracker] Including ${reasoningTokens} reasoning tokens`);
+            // If reasoning tokens exist and are included in token_count, subtract them
+            // We track them separately for more accurate breakdown
+            if (reasoningTokens > 0 && message.extra.token_count > reasoningTokens) {
+                outputTokens = message.extra.token_count - reasoningTokens;
             }
-            console.log(`[Token Usage Tracker] Manually counted tokens: ${outputTokens}`);
+            console.log(`[Token Usage Tracker] Token count: ${outputTokens} response + ${reasoningTokens} reasoning`);
+        } else {
+            // Fall back to manual counting (just the message, not reasoning)
+            outputTokens = await countTokens(message.mes);
+            console.log(`[Token Usage Tracker] Manually counted: ${outputTokens} response + ${reasoningTokens} reasoning`);
         }
 
         // For 'continue' type, we only want the newly generated tokens, not the full message
@@ -656,9 +672,9 @@ async function handleMessageReceived(messageIndex, type) {
         // Get current chat ID if available
         const chatId = context.chatMetadata?.chat_id || null;
 
-        recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId);
+        recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId, reasoningTokens);
 
-        console.log(`[Token Usage Tracker] Recorded exchange: ${inputTokens} in, ${outputTokens} out, model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'}${savedPreContinueCount > 0 ? ' (continue delta)' : ''}`);
+        console.log(`[Token Usage Tracker] Recorded exchange: ${inputTokens} in, ${outputTokens} out, ${reasoningTokens} reasoning, model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'}${savedPreContinueCount > 0 ? ' (continue delta)' : ''}`);
     } catch (error) {
         console.error('[Token Usage Tracker] Error counting output tokens:', error);
     }
@@ -807,6 +823,125 @@ function registerSlashCommands() {
         },
         returns: 'Confirmation message',
         helpString: 'Resets token usage. Use /tokenreset for session only, or /tokenreset all for all data.',
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'tokencost',
+        callback: async () => {
+            const settings = getSettings();
+            const byModel = settings.usage.byModel;
+            const lines = ['**Cost Breakdown by Model:**'];
+            let totalCost = 0;
+
+            for (const [modelId, data] of Object.entries(byModel)) {
+                const cost = calculateCost(data.input, data.output, modelId);
+                totalCost += cost;
+                if (cost > 0) {
+                    lines.push(`• ${modelId}: $${cost.toFixed(4)} (${formatNumberFull(data.input)} in, ${formatNumberFull(data.output)} out)`);
+                }
+            }
+
+            if (lines.length === 1) {
+                return 'No cost data available. Configure model prices in the Token Usage Tracker settings.';
+            }
+
+            lines.push(`**Total: $${totalCost.toFixed(2)}**`);
+            return lines.join('\n');
+        },
+        returns: 'Cost breakdown by model',
+        helpString: 'Displays estimated cost breakdown by model. Configure prices in extension settings.',
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'tokentoday',
+        callback: async () => {
+            const stats = getUsageStats();
+            const efficiency = calculateEfficiencyMetrics(stats.today);
+            return [
+                `**Today's Token Usage:**`,
+                `Total: ${formatNumberFull(stats.today.total)} tokens`,
+                `Input: ${formatNumberFull(stats.today.input || 0)} tokens`,
+                `Output: ${formatNumberFull(stats.today.output || 0)} tokens`,
+                `Messages: ${stats.today.messageCount || 0}`,
+                `Efficiency: ${efficiency.ratio.toFixed(2)}× out/in, ${formatTokens(efficiency.perMessage)}/msg`,
+            ].join('\n');
+        },
+        returns: "Today's token usage",
+        helpString: "Displays today's token usage with efficiency metrics.",
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'tokenchat',
+        callback: async () => {
+            const context = getContext();
+            const chatId = context.chatMetadata?.chat_id;
+
+            if (!chatId) {
+                return 'No active chat found.';
+            }
+
+            const chatUsage = getChatUsage(chatId);
+            const efficiency = calculateEfficiencyMetrics(chatUsage);
+
+            return [
+                `**Current Chat Usage:**`,
+                `Chat ID: ${chatId}`,
+                `Total: ${formatNumberFull(chatUsage.total)} tokens`,
+                `Input: ${formatNumberFull(chatUsage.input)} tokens`,
+                `Output: ${formatNumberFull(chatUsage.output)} tokens`,
+                `Messages: ${chatUsage.messageCount}`,
+                `Efficiency: ${efficiency.ratio.toFixed(2)}× out/in, ${formatTokens(efficiency.perMessage)}/msg`,
+            ].join('\n');
+        },
+        returns: 'Current chat token usage',
+        helpString: 'Displays token usage for the current chat.',
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'tokenexport',
+        callback: async () => {
+            const exportData = exportUsageData();
+
+            // Create and trigger download
+            const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `token-usage-export-${getDayKey()}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            return 'Token usage data exported successfully.';
+        },
+        returns: 'Export confirmation',
+        helpString: 'Exports all token usage data as a JSON file.',
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'tokenimport',
+        callback: async (args, value) => {
+            if (!value || !value.trim()) {
+                return 'Usage: /tokenimport [json data] or paste JSON directly. Use /tokenexport first to get the format.';
+            }
+
+            try {
+                const result = importUsageData(value.trim());
+                return result.message;
+            } catch (error) {
+                return `Import failed: ${error.message}`;
+            }
+        },
+        returns: 'Import result',
+        helpString: 'Imports token usage data from JSON. Use /tokenexport to see the expected format.',
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({
+                description: 'JSON data to import',
+                typeList: ['string'],
+                isRequired: true,
+            }),
+        ],
     }));
 }
 
@@ -989,11 +1124,176 @@ function calculateAllTimeCost() {
     return totalCost;
 }
 
+/**
+ * Calculate token efficiency metrics
+ * @param {Object} data - Usage data with input, output, total, and messageCount
+ * @returns {Object} Efficiency metrics
+ */
+function calculateEfficiencyMetrics(data) {
+    const ratio = data.input > 0 ? (data.output / data.input) : 0;
+    const perMessage = data.messageCount > 0
+        ? Math.round(data.total / data.messageCount)
+        : 0;
+    return { ratio, perMessage };
+}
+
+/**
+ * Export all usage data for backup
+ * @returns {Object} Export data object
+ */
+function exportUsageData() {
+    const settings = getSettings();
+    return {
+        version: '1.0',
+        exportDate: new Date().toISOString(),
+        extensionName: extensionName,
+        usage: settings.usage,
+        modelPrices: settings.modelPrices,
+        modelColors: settings.modelColors
+    };
+}
+
+/**
+ * Import usage data from JSON
+ * @param {string} jsonString - JSON string to import
+ * @returns {Object} Result object with success status and message
+ */
+function importUsageData(jsonString) {
+    let data;
+    try {
+        data = JSON.parse(jsonString);
+    } catch (e) {
+        throw new Error('Invalid JSON format');
+    }
+
+    // Validate structure
+    if (!data.version || !data.usage) {
+        throw new Error('Invalid export format. Missing required fields.');
+    }
+
+    if (data.extensionName && data.extensionName !== extensionName) {
+        throw new Error(`Data was exported from a different extension: ${data.extensionName}`);
+    }
+
+    const settings = getSettings();
+
+    // Import usage data (merge with existing)
+    if (data.usage.session) {
+        // Don't import session data - it's ephemeral
+    }
+
+    // Merge byDay data
+    if (data.usage.byDay) {
+        for (const [dayKey, dayData] of Object.entries(data.usage.byDay)) {
+            if (!settings.usage.byDay[dayKey]) {
+                settings.usage.byDay[dayKey] = dayData;
+            } else {
+                // Merge: add tokens if day already exists
+                settings.usage.byDay[dayKey].input += dayData.input || 0;
+                settings.usage.byDay[dayKey].output += dayData.output || 0;
+                settings.usage.byDay[dayKey].total += dayData.total || 0;
+                settings.usage.byDay[dayKey].messageCount += dayData.messageCount || 0;
+            }
+        }
+    }
+
+    // Merge byHour data
+    if (data.usage.byHour) {
+        for (const [hourKey, hourData] of Object.entries(data.usage.byHour)) {
+            if (!settings.usage.byHour[hourKey]) {
+                settings.usage.byHour[hourKey] = hourData;
+            } else {
+                settings.usage.byHour[hourKey].input += hourData.input || 0;
+                settings.usage.byHour[hourKey].output += hourData.output || 0;
+                settings.usage.byHour[hourKey].total += hourData.total || 0;
+                settings.usage.byHour[hourKey].messageCount += hourData.messageCount || 0;
+            }
+        }
+    }
+
+    // Merge model prices (overwrite existing)
+    if (data.modelPrices) {
+        Object.assign(settings.modelPrices, data.modelPrices);
+    }
+
+    // Merge model colors (overwrite existing)
+    if (data.modelColors) {
+        Object.assign(settings.modelColors, data.modelColors);
+    }
+
+    saveSettings();
+    eventSource.emit('tokenUsageUpdated', getUsageStats());
+
+    return {
+        success: true,
+        message: `Import successful. Merged data from ${data.exportDate || 'unknown date'}.`
+    };
+}
+
 // Chart state
 let currentChartRange = 30;
 let currentSourceFilter = 'all'; // 'all' or specific source ID like 'openai', 'textgenerationwebui'
+let currentChartType = 'bar'; // 'bar' or 'line'
+let currentGranularity = 'daily'; // 'daily' or 'hourly'
 let chartData = [];
 let tooltip = null;
+
+// Health check state
+let lastRecordedTimestamp = null;
+let lastErrorTimestamp = null;
+let lastErrorMessage = null;
+
+/**
+ * Get health status of the extension
+ * @returns {Object} Health status object with status, lastActivity, and details
+ */
+function getHealthStatus() {
+    const tokenizerAvailable = typeof getTokenCountAsync === 'function';
+    const hasRecordedActivity = lastRecordedTimestamp !== null;
+
+    let timeSinceActivity = null;
+    if (lastRecordedTimestamp) {
+        const elapsed = Date.now() - new Date(lastRecordedTimestamp).getTime();
+        if (elapsed < 60000) {
+            timeSinceActivity = Math.round(elapsed / 1000) + 's ago';
+        } else if (elapsed < 3600000) {
+            timeSinceActivity = Math.round(elapsed / 60000) + 'm ago';
+        } else if (elapsed < 86400000) {
+            timeSinceActivity = Math.round(elapsed / 3600000) + 'h ago';
+        } else {
+            timeSinceActivity = Math.round(elapsed / 86400000) + 'd ago';
+        }
+    }
+
+    const hasRecentError = lastErrorTimestamp &&
+        (Date.now() - new Date(lastErrorTimestamp).getTime() < 300000); // Error within last 5 min
+
+    let status = 'healthy';
+    if (hasRecentError) {
+        status = 'warning';
+    } else if (!tokenizerAvailable) {
+        status = 'error';
+    }
+
+    return {
+        status,
+        lastActivity: timeSinceActivity,
+        details: {
+            tokenizerAvailable,
+            hasRecordedActivity,
+            lastError: hasRecentError ? lastErrorMessage : null
+        }
+    };
+}
+
+/**
+ * Record an error for health tracking
+ * @param {string} message - Error message
+ */
+function recordHealthError(message) {
+    lastErrorTimestamp = new Date().toISOString();
+    lastErrorMessage = message;
+}
 
 // Chart colors - adapted for dark theme
 const CHART_COLORS = {
@@ -1064,6 +1364,52 @@ function getChartData(days, sourceFilter = 'all') {
         });
     }
     return data;
+}
+
+/**
+ * Get hourly chart data from real usage stats
+ * @param {number} hours - Number of hours to include
+ * @param {string} sourceFilter - Source to filter by, or 'all' for combined
+ */
+function getHourlyChartData(hours, sourceFilter = 'all') {
+    const settings = getSettings();
+    const byHour = settings.usage.byHour || {};
+    const data = [];
+    const now = new Date();
+
+    for (let i = hours - 1; i >= 0; i--) {
+        const date = new Date(now);
+        date.setHours(date.getHours() - i);
+        const hourKey = getHourKey(date);
+        const hourData = byHour[hourKey] || { total: 0, input: 0, output: 0, messageCount: 0 };
+
+        // For hourly data, we don't have per-source breakdown at hour level currently
+        // Use the raw hourly data
+        data.push({
+            date: date,
+            hourKey: hourKey,
+            usage: hourData.total || 0,
+            input: hourData.input || 0,
+            output: hourData.output || 0,
+            models: {},
+            displayDate: new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: true }).format(date),
+            fullDate: new Intl.DateTimeFormat('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', hour12: true }).format(date)
+        });
+    }
+    return data;
+}
+
+/**
+ * Get chart data based on current granularity setting
+ */
+function getChartDataForGranularity() {
+    if (currentGranularity === 'hourly') {
+        // Map range days to hours: 1D = 24h, 7D = 24*3h = 72h (every 3 hours for a week), 30D = 24*7h = 168h, 90D = 24*14h = 336h
+        const hoursMap = { 1: 24, 7: 72, 30: 168, 90: 336 };
+        const hours = hoursMap[currentChartRange] || 24;
+        return getHourlyChartData(hours, currentSourceFilter);
+    }
+    return getChartData(currentChartRange, currentSourceFilter);
 }
 
 /**
@@ -1154,7 +1500,12 @@ function renderChart() {
     let barWidth = totalBarWidth * 0.8;
     if (barWidth > 40) barWidth = 40;
     const actualGap = totalBarWidth - barWidth;
-    const labelInterval = currentChartRange === 90 ? 7 : currentChartRange === 30 ? 3 : 1;
+    const maxLabels = Math.max(2, Math.floor(chartWidth / 40));
+    const hourlyLabelInterval = Math.max(1, Math.ceil(chartData.length / maxLabels));
+    const labelInterval = currentGranularity === 'hourly'
+        ? hourlyLabelInterval
+        : (currentChartRange === 90 ? 7 : currentChartRange === 30 ? 3 : 1);
+    const xLabelFontSize = chartData.length > 60 ? '9' : '10';
 
     chartData.forEach((d, i) => {
         const slotX = margin.left + (i * totalBarWidth);
@@ -1266,6 +1617,181 @@ function renderChart() {
                 'text-anchor': 'middle',
                 fill: CHART_COLORS.text,
                 opacity: '0.6',
+                'font-size': xLabelFontSize,
+                'font-family': 'ui-sans-serif, system-ui, sans-serif'
+            });
+            label.textContent = d.displayDate;
+            textGroup.appendChild(label);
+        }
+    });
+
+    container.appendChild(svg);
+}
+
+/**
+ * Render the line chart variant
+ */
+function renderLineChart() {
+    const container = document.getElementById('token-usage-chart');
+    if (!container) return;
+
+    container.innerHTML = '';
+    const rect = container.getBoundingClientRect();
+    const width = rect.width || 400;
+    const height = rect.height || 200;
+
+    if (width === 0 || height === 0) return;
+    if (chartData.length === 0) {
+        container.innerHTML = '<div style="text-align: center; color: rgba(255,255,255,0.5); padding: 40px;">No usage data yet</div>';
+        return;
+    }
+
+    const margin = { top: 10, right: 10, bottom: 25, left: 45 };
+    const chartWidth = width - margin.left - margin.right;
+    const chartHeight = height - margin.top - margin.bottom;
+
+    const svg = createSVGElement('svg', {
+        width: width,
+        height: height,
+        viewBox: `0 0 ${width} ${height}`,
+        style: 'display: block; max-width: 100%;'
+    });
+
+    const gridGroup = createSVGElement('g', { class: 'grid' });
+    const areaGroup = createSVGElement('g', { class: 'area' });
+    const lineGroup = createSVGElement('g', { class: 'lines' });
+    const dotGroup = createSVGElement('g', { class: 'dots' });
+    const textGroup = createSVGElement('g', { class: 'labels' });
+
+    svg.appendChild(gridGroup);
+    svg.appendChild(areaGroup);
+    svg.appendChild(lineGroup);
+    svg.appendChild(dotGroup);
+    svg.appendChild(textGroup);
+
+    // Y Scale
+    const maxUsage = Math.max(...chartData.map(d => d.usage), 1);
+    const roughStep = maxUsage / 4;
+    const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep || 1)));
+    let step = Math.ceil(roughStep / magnitude) * magnitude || 1000;
+
+    if (step / magnitude < 1.5) step = 1 * magnitude;
+    else if (step / magnitude < 3) step = 2.5 * magnitude;
+    else if (step / magnitude < 7) step = 5 * magnitude;
+    else step = 10 * magnitude;
+
+    let niceMax = Math.ceil(maxUsage / step) * step;
+    if (niceMax === 0) niceMax = 5000;
+
+    const yScale = (val) => chartHeight - (val / niceMax) * chartHeight;
+    const xScale = (i) => margin.left + (i / (chartData.length - 1 || 1)) * chartWidth;
+
+    // Grid and Y axis
+    for (let val = 0; val <= niceMax; val += step) {
+        const y = margin.top + yScale(val);
+
+        const line = createSVGElement('line', {
+            x1: margin.left,
+            y1: y,
+            x2: width - margin.right,
+            y2: y,
+            stroke: CHART_COLORS.grid,
+            'stroke-width': '1',
+            'stroke-dasharray': '4 4'
+        });
+        gridGroup.appendChild(line);
+
+        const text = createSVGElement('text', {
+            x: margin.left - 8,
+            y: y + 4,
+            'text-anchor': 'end',
+            fill: CHART_COLORS.text,
+            'font-size': '10',
+            'font-family': 'ui-sans-serif, system-ui, sans-serif'
+        });
+        text.textContent = formatTokens(val);
+        textGroup.appendChild(text);
+    }
+
+    // Build area path (filled under the line)
+    if (chartData.length > 1) {
+        let areaPath = `M ${xScale(0)},${margin.top + chartHeight}`;
+        chartData.forEach((d, i) => {
+            areaPath += ` L ${xScale(i)},${margin.top + yScale(d.usage)}`;
+        });
+        areaPath += ` L ${xScale(chartData.length - 1)},${margin.top + chartHeight} Z`;
+
+        const area = createSVGElement('path', {
+            d: areaPath,
+            fill: 'var(--SmartThemeBorderColor)',
+            opacity: '0.2',
+            'pointer-events': 'none'
+        });
+        areaGroup.appendChild(area);
+    }
+
+    // Build line path
+    let linePath = '';
+    chartData.forEach((d, i) => {
+        const x = xScale(i);
+        const y = margin.top + yScale(d.usage);
+        linePath += i === 0 ? `M ${x},${y}` : ` L ${x},${y}`;
+    });
+
+    const path = createSVGElement('path', {
+        d: linePath,
+        fill: 'none',
+        stroke: 'var(--SmartThemeBodyColor)',
+        'stroke-width': '2',
+        'stroke-linecap': 'round',
+        'stroke-linejoin': 'round',
+        'pointer-events': 'none'
+    });
+    lineGroup.appendChild(path);
+
+    // Dots and labels
+    const maxLabels = Math.max(2, Math.floor(chartWidth / 50));
+    const hourlyLabelInterval = Math.max(1, Math.ceil(chartData.length / maxLabels));
+    const labelInterval = currentGranularity === 'hourly'
+        ? hourlyLabelInterval
+        : (chartData.length > 50 ? 7 : chartData.length > 20 ? 3 : 1);
+    const dotR = chartData.length > 120 ? 2.5 : chartData.length > 60 ? 3 : 4;
+    chartData.forEach((d, i) => {
+        const x = xScale(i);
+        const y = margin.top + yScale(d.usage);
+
+        // Interactive dot
+        const dot = createSVGElement('circle', {
+            cx: x,
+            cy: y,
+            r: dotR,
+            fill: 'var(--SmartThemeBodyColor)',
+            stroke: 'var(--SmartThemeInputColor)',
+            'stroke-width': '2',
+            style: 'cursor: pointer;'
+        });
+
+        dot.addEventListener('mouseenter', () => {
+            dot.setAttribute('r', String(dotR + 2));
+            showTooltip(d);
+        });
+        dot.addEventListener('mousemove', (e) => {
+            moveTooltip(e);
+        });
+        dot.addEventListener('mouseleave', () => {
+            dot.setAttribute('r', String(dotR));
+            hideTooltip();
+        });
+        dotGroup.appendChild(dot);
+
+        // X labels
+        if (i % labelInterval === 0) {
+            const label = createSVGElement('text', {
+                x: x,
+                y: height - 5,
+                'text-anchor': 'middle',
+                fill: CHART_COLORS.text,
+                opacity: '0.6',
                 'font-size': '10',
                 'font-family': 'ui-sans-serif, system-ui, sans-serif'
             });
@@ -1275,6 +1801,17 @@ function renderChart() {
     });
 
     container.appendChild(svg);
+}
+
+/**
+ * Render chart based on current chart type
+ */
+function renderChartByType() {
+    if (currentChartType === 'line') {
+        renderLineChart();
+    } else {
+        renderChart();
+    }
 }
 
 function showTooltip(d) {
@@ -1353,8 +1890,8 @@ function hideTooltip() {
 
 function updateChartRange(range) {
     currentChartRange = range;
-    chartData = getChartData(range, currentSourceFilter);
-    renderChart();
+    chartData = getChartDataForGranularity();
+    renderChartByType();
 
     document.querySelectorAll('.token-usage-range-btn').forEach(btn => {
         const val = parseInt(btn.getAttribute('data-value'));
@@ -1371,8 +1908,8 @@ function updateChartRange(range) {
  */
 function updateSourceFilter(sourceId) {
     currentSourceFilter = sourceId;
-    chartData = getChartData(currentChartRange, currentSourceFilter);
-    renderChart();
+    chartData = getChartDataForGranularity();
+    renderChartByType();
     updateUIStats();
 }
 
@@ -1391,6 +1928,14 @@ function getAvailableSources() {
 function formatSourceName(sourceId) {
     const names = {
         'openai': 'OpenAI',
+        'custom': 'Custom (OpenAI-compatible)',
+        'claude': 'Claude',
+        'windowai': 'Window AI',
+        'openrouter': 'OpenRouter',
+        'ai21': 'AI21',
+        'mistralai': 'Mistral AI',
+        'makersuite': 'Google AI',
+        'groq': 'Groq',
         'textgenerationwebui': 'Text Gen WebUI',
         'novel': 'NovelAI',
         'kobold': 'KoboldAI',
@@ -1439,6 +1984,7 @@ function updateUIStats() {
     $('#token-usage-today-total').text(formatTokens(stats.today.total));
     $('#token-usage-today-in').text(formatTokens(stats.today.input || 0));
     $('#token-usage-today-out').text(formatTokens(stats.today.output || 0));
+    $('#token-usage-today-reasoning').text(formatTokens(stats.today.reasoning || 0));
 
     // Stats grid
     $('#token-usage-week-total').text(formatTokens(stats.thisWeek.total));
@@ -1504,15 +2050,86 @@ function updateUIStats() {
 
     $('#token-usage-tokenizer').text('Tokenizer: ' + (stats.tokenizer || 'Unknown'));
 
-    // Update chart data with current source filter
-    chartData = getChartData(currentChartRange, currentSourceFilter);
-    renderChart();
+    // Update efficiency metrics
+    const sessionEfficiency = calculateEfficiencyMetrics(stats.session);
+    const allTimeEfficiency = calculateEfficiencyMetrics(stats.allTime);
+
+    $('#token-usage-efficiency-ratio').text(sessionEfficiency.ratio.toFixed(2) + '×');
+    $('#token-usage-efficiency-permsg').text(formatTokens(sessionEfficiency.perMessage));
+    $('#token-usage-efficiency-alltime-ratio').text(allTimeEfficiency.ratio.toFixed(2) + '×');
+    $('#token-usage-efficiency-alltime-permsg').text(formatTokens(allTimeEfficiency.perMessage));
+
+    // Update chart data with current granularity and source filter
+    chartData = getChartDataForGranularity();
+    renderChartByType();
 
     // Update source dropdown options (in case new sources were added)
     updateSourceDropdown();
 
     // Update model colors grid
     renderModelColorsGrid();
+
+    // Update current chat usage
+    updateChatUsageDisplay();
+
+    // Update health indicator
+    updateHealthIndicator();
+}
+
+
+/**
+ * Update the health indicator in the UI header
+ */
+function updateHealthIndicator() {
+    const health = getHealthStatus();
+    const indicator = $('#token-usage-health-indicator');
+    if (indicator.length === 0) return;
+
+    const statusEmoji = {
+        'healthy': '🟢',
+        'warning': '🟡',
+        'error': '🔴'
+    };
+
+    let tooltipText = `Status: ${health.status}`;
+    if (health.lastActivity) {
+        tooltipText += `\nLast activity: ${health.lastActivity}`;
+    }
+    if (health.details.lastError) {
+        tooltipText += `\nLast error: ${health.details.lastError}`;
+    }
+    if (!health.details.tokenizerAvailable) {
+        tooltipText += '\nWarning: Tokenizer not available';
+    }
+
+    indicator.text(statusEmoji[health.status] || '🟡');
+    indicator.attr('title', tooltipText);
+}
+
+
+/**
+ * Update the current chat usage display
+ */
+function updateChatUsageDisplay() {
+    const context = getContext();
+    const chatId = context.chatMetadata?.chat_id;
+
+    if (!chatId) {
+        $('#token-usage-chat-total').text('0');
+        $('#token-usage-chat-messages').text('0');
+        $('#token-usage-chat-input').text('0');
+        $('#token-usage-chat-output').text('0');
+        $('#token-usage-chat-id').text('No chat active');
+        return;
+    }
+
+    const chatUsage = getChatUsage(chatId);
+
+    $('#token-usage-chat-total').text(formatTokens(chatUsage.total));
+    $('#token-usage-chat-messages').text(chatUsage.messageCount);
+    $('#token-usage-chat-input').text(formatTokens(chatUsage.input));
+    $('#token-usage-chat-output').text(formatTokens(chatUsage.output));
+    $('#token-usage-chat-id').text(`Chat: ${chatId}`);
 }
 
 
@@ -1559,7 +2176,7 @@ function renderModelColorsGrid() {
         // Color picker handler
         row.find('.model-color-picker').on('change', function () {
             setModelColor(String($(this).data('model')), String($(this).val()));
-            renderChart();
+            renderChartByType();
         });
 
         // Price input handlers with debounce
@@ -1594,6 +2211,7 @@ function createSettingsUI() {
             <div class="inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header">
                     <b>Token Usage Tracker</b>
+                    <span id="token-usage-health-indicator" style="margin-left: 6px; font-size: 10px; cursor: help;" title="Extension health status">🟢</span>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
@@ -1607,7 +2225,8 @@ function createSettingsUI() {
                             </div>
                             <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;">
                                 <span id="token-usage-today-in">${formatTokens(stats.today.input || 0)}</span> in /
-                                <span id="token-usage-today-out">${formatTokens(stats.today.output || 0)}</span> out
+                                <span id="token-usage-today-out">${formatTokens(stats.today.output || 0)}</span> out /
+                                <span id="token-usage-today-reasoning">${formatTokens(stats.today.reasoning || 0)}</span> 🧠
                             </div>
                         </div>
                         <div style="display: flex; align-items: center; gap: 6px;">
@@ -1615,10 +2234,23 @@ function createSettingsUI() {
                                 <option value="all">All Sources</option>
                             </select>
                             <div style="display: inline-flex; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; padding: 2px;">
+                                <button class="token-usage-range-btn menu_button" data-value="1" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">1D</button>
                                 <button class="token-usage-range-btn menu_button" data-value="7" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">7D</button>
                                 <button class="token-usage-range-btn menu_button active" data-value="30" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">30D</button>
                                 <button class="token-usage-range-btn menu_button" data-value="90" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">90D</button>
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- Chart Options -->
+                    <div style="display: flex; justify-content: flex-end; gap: 6px; margin-bottom: 6px;">
+                        <div style="display: inline-flex; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; padding: 2px;">
+                            <button class="token-usage-granularity-btn menu_button active" data-value="daily" style="padding: 3px 8px; font-size: 10px; border-radius: 4px;">Daily</button>
+                            <button class="token-usage-granularity-btn menu_button" data-value="hourly" style="padding: 3px 8px; font-size: 10px; border-radius: 4px;">Hourly</button>
+                        </div>
+                        <div style="display: inline-flex; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; padding: 2px;">
+                            <button class="token-usage-charttype-btn menu_button active" data-value="bar" style="padding: 3px 8px; font-size: 10px; border-radius: 4px;">📊 Bar</button>
+                            <button class="token-usage-charttype-btn menu_button" data-value="line" style="padding: 3px 8px; font-size: 10px; border-radius: 4px;">📈 Line</button>
                         </div>
                     </div>
 
@@ -1655,6 +2287,67 @@ function createSettingsUI() {
                             <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
                             <div style="flex: 1; padding: 4px 8px; display: flex; align-items: center; justify-content: center;">
                                 <span style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-alltime-cost">$0.00</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Efficiency Metrics -->
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 10px;">
+                        <div style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); padding: 6px 10px;">
+                            <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Session Efficiency</div>
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 2px;">
+                                <div>
+                                    <span style="font-size: 13px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-efficiency-ratio">0.00×</span>
+                                    <span style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> out/in</span>
+                                </div>
+                                <div>
+                                    <span style="font-size: 13px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-efficiency-permsg">0</span>
+                                    <span style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> /msg</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); padding: 6px 10px;">
+                            <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">All-Time Efficiency</div>
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 2px;">
+                                <div>
+                                    <span style="font-size: 13px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-efficiency-alltime-ratio">0.00×</span>
+                                    <span style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> out/in</span>
+                                </div>
+                                <div>
+                                    <span style="font-size: 13px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-efficiency-alltime-permsg">0</span>
+                                    <span style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> /msg</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Current Chat Usage -->
+                    <div class="inline-drawer" style="margin-bottom: 10px;">
+                        <div class="inline-drawer-toggle inline-drawer-header" style="padding: 4px 0 4px 8px;">
+                            <span style="font-size: 11px;">Current Chat</span>
+                            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                        </div>
+                        <div class="inline-drawer-content">
+                            <div id="token-usage-chat-stats" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); padding: 8px 10px;">
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+                                    <div>
+                                        <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Total</div>
+                                        <div style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-chat-total">0</div>
+                                    </div>
+                                    <div>
+                                        <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Messages</div>
+                                        <div style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-chat-messages">0</div>
+                                    </div>
+                                    <div>
+                                        <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Input</div>
+                                        <div style="font-size: 12px; color: var(--SmartThemeBodyColor);" id="token-usage-chat-input">0</div>
+                                    </div>
+                                    <div>
+                                        <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Output</div>
+                                        <div style="font-size: 12px; color: var(--SmartThemeBodyColor);" id="token-usage-chat-output">0</div>
+                                    </div>
+                                </div>
+                                <div style="margin-top: 6px; font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;" id="token-usage-chat-id">No chat active</div>
                             </div>
                         </div>
                     </div>
@@ -1706,8 +2399,8 @@ function createSettingsUI() {
     tooltip = document.getElementById('token-usage-tooltip');
 
     // Initialize chart
-    chartData = getChartData(currentChartRange, currentSourceFilter);
-    setTimeout(renderChart, 100);
+    chartData = getChartDataForGranularity();
+    setTimeout(renderChartByType, 100);
 
     // Initialize source dropdown
     updateSourceDropdown();
@@ -1716,6 +2409,29 @@ function createSettingsUI() {
     document.querySelectorAll('.token-usage-range-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             updateChartRange(parseInt(btn.getAttribute('data-value')));
+        });
+    });
+
+    // Granularity button handlers
+    document.querySelectorAll('.token-usage-granularity-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const value = btn.getAttribute('data-value');
+            currentGranularity = value;
+            document.querySelectorAll('.token-usage-granularity-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            chartData = getChartDataForGranularity();
+            renderChartByType();
+        });
+    });
+
+    // Chart type button handlers
+    document.querySelectorAll('.token-usage-charttype-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const value = btn.getAttribute('data-value');
+            currentChartType = value;
+            document.querySelectorAll('.token-usage-charttype-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            renderChartByType();
         });
     });
 
@@ -1745,7 +2461,7 @@ function createSettingsUI() {
                 // Only re-render if width actually changed
                 if (Math.abs(newWidth - lastWidth) > 5) {
                     lastWidth = newWidth;
-                    renderChart();
+                    renderChartByType();
                 }
             }
         });
