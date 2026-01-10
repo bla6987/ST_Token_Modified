@@ -371,8 +371,32 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, s
 
     // By hour
     const hourKey = getHourKey(now);
-    if (!usage.byHour[hourKey]) usage.byHour[hourKey] = { input: 0, output: 0, total: 0, messageCount: 0 };
+    if (!usage.byHour[hourKey]) usage.byHour[hourKey] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, models: {}, sources: {} };
     addTokens(usage.byHour[hourKey]);
+
+    // Track model within hour for cost calculation
+    if (modelId) {
+        if (!usage.byHour[hourKey].models) usage.byHour[hourKey].models = {};
+        if (!usage.byHour[hourKey].models[modelId]) {
+            usage.byHour[hourKey].models[modelId] = { input: 0, output: 0, total: 0 };
+        }
+        const hourModelData = usage.byHour[hourKey].models[modelId];
+        hourModelData.input += inputTokens;
+        hourModelData.output += outputTokens;
+        hourModelData.total += totalTokens;
+    }
+
+    // Track source within hour for filtering
+    if (sourceId) {
+        if (!usage.byHour[hourKey].sources) usage.byHour[hourKey].sources = {};
+        if (!usage.byHour[hourKey].sources[sourceId]) {
+            usage.byHour[hourKey].sources[sourceId] = { input: 0, output: 0, total: 0 };
+        }
+        const hourSourceData = usage.byHour[hourKey].sources[sourceId];
+        hourSourceData.input += inputTokens;
+        hourSourceData.output += outputTokens;
+        hourSourceData.total += totalTokens;
+    }
 
     // By week
     const weekKey = getWeekKey(now);
