@@ -2353,7 +2353,14 @@ function showMiniview() {
     if (!miniviewElement) {
         createMiniview();
     }
-    $(miniviewElement).fadeIn(150);
+    // Show the element first so we can measure its actual size
+    $(miniviewElement).fadeIn(150, function () {
+        // Use requestAnimationFrame to ensure the DOM has updated before measuring
+        requestAnimationFrame(() => {
+            // Re-apply position after visible, so getBoundingClientRect works correctly
+            applyMiniviewPosition();
+        });
+    });
 }
 
 /**
@@ -2433,30 +2440,98 @@ function cycleMiniviewMode() {
 
 /**
  * Apply saved position to miniview
+ * NOTE: Uses top/left positioning instead of bottom/right because SillyTavern's
+ * HTML element has perspective:1000px which creates a containing block that breaks
+ * fixed positioning when combined with bottom/right on some viewport configurations.
  */
 function applyMiniviewPosition() {
     if (!miniviewElement) return;
 
     const settings = getSettings();
-    const position = settings.miniview?.position || { bottom: 80, right: 20 };
+    const savedPosition = settings.miniview?.position || { bottom: 80, right: 20 };
 
-    // Validate position is within viewport bounds
-    const rect = miniviewElement.getBoundingClientRect();
-    const maxBottom = window.innerHeight - rect.height - 10;
-    const maxRight = window.innerWidth - rect.width - 10;
+    // Get viewport dimensions
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
 
-    const validBottom = Math.max(10, Math.min(position.bottom, maxBottom));
-    const validRight = Math.max(10, Math.min(position.right, maxRight));
+    // Get miniview dimensions - measure actual element if visible, otherwise use conservative estimates
+    let width, height;
+    const isVisible = $(miniviewElement).is(':visible') || miniviewElement.style.display !== 'none';
 
-    miniviewElement.style.bottom = `${validBottom}px`;
-    miniviewElement.style.right = `${validRight}px`;
-    // Clear any top/left that might interfere
-    miniviewElement.style.top = 'auto';
-    miniviewElement.style.left = 'auto';
+    if (isVisible) {
+        const rect = miniviewElement.getBoundingClientRect();
+        width = rect.width || 180;
+        height = rect.height || 200;
+    } else {
+        // When hidden, use saved size or conservative estimates
+        const size = settings.miniview?.size || { width: 180, height: null };
+        width = size.width || 180;
+        height = size.height || 200;
+    }
+
+    // Ensure we have reasonable minimums
+    width = Math.max(width, 140);
+    height = Math.max(height, 150);
+
+    // Convert saved bottom/right to top/left
+    // bottom: X means element bottom is X px from viewport bottom
+    // So top = viewportHeight - bottom - height
+    // right: X means element right is X px from viewport right
+    // So left = viewportWidth - right - width
+    let top = viewportHeight - savedPosition.bottom - height;
+    let left = viewportWidth - savedPosition.right - width;
+
+    // Clamp to viewport bounds (with 10px margin)
+    const minTop = 10;
+    const maxTop = viewportHeight - height - 10;
+    const minLeft = 10;
+    const maxLeft = viewportWidth - width - 10;
+
+    top = Math.max(minTop, Math.min(top, maxTop));
+    left = Math.max(minLeft, Math.min(left, maxLeft));
+
+    // Apply position using top/left (more reliable with SillyTavern's CSS)
+    miniviewElement.style.top = `${top}px`;
+    miniviewElement.style.left = `${left}px`;
+    miniviewElement.style.bottom = 'auto';
+    miniviewElement.style.right = 'auto';
+
+    // Convert back to bottom/right for saving (maintains compatibility with existing settings)
+    const newBottom = viewportHeight - top - height;
+    const newRight = viewportWidth - left - width;
+
+    // Save corrected position if it was out of bounds
+    if (Math.abs(newBottom - savedPosition.bottom) > 1 || Math.abs(newRight - savedPosition.right) > 1) {
+        if (!settings.miniview) {
+            settings.miniview = { pinned: false, mode: 'session', position: {} };
+        }
+        if (!settings.miniview.position) {
+            settings.miniview.position = {};
+        }
+        settings.miniview.position.bottom = Math.round(newBottom);
+        settings.miniview.position.right = Math.round(newRight);
+        saveSettings();
+    }
+}
+
+/**
+ * Handle window resize to keep miniview within viewport
+ */
+function handleMiniviewResize() {
+    if (!miniviewElement || !$(miniviewElement).is(':visible')) return;
+    applyMiniviewPosition();
+}
+
+// Debounced resize handler
+let miniviewResizeTimer = null;
+function debouncedMiniviewResize() {
+    clearTimeout(miniviewResizeTimer);
+    miniviewResizeTimer = setTimeout(handleMiniviewResize, 100);
 }
 
 /**
  * Setup drag and drop for miniview
+ * Uses top/left positioning to match applyMiniviewPosition
  */
 function setupMiniviewDrag() {
     if (!miniviewElement) return;
@@ -2467,8 +2542,8 @@ function setupMiniviewDrag() {
     let isDragging = false;
     let startX = 0;
     let startY = 0;
-    let startBottom = 0;
-    let startRight = 0;
+    let startTop = 0;
+    let startLeft = 0;
 
     // Make header show it's draggable
     header.style.cursor = 'grab';
@@ -2486,10 +2561,17 @@ function setupMiniviewDrag() {
         startX = clientX;
         startY = clientY;
 
-        // Get current position from computed style
+        // Get current position from computed style (top/left)
         const style = window.getComputedStyle(miniviewElement);
-        startBottom = parseInt(style.bottom, 10) || 80;
-        startRight = parseInt(style.right, 10) || 20;
+        startTop = parseInt(style.top, 10);
+        startLeft = parseInt(style.left, 10);
+
+        // If top/left are auto, calculate from bounding rect
+        if (isNaN(startTop) || isNaN(startLeft)) {
+            const rect = miniviewElement.getBoundingClientRect();
+            startTop = rect.top;
+            startLeft = rect.left;
+        }
 
         e.preventDefault();
     };
@@ -2500,25 +2582,27 @@ function setupMiniviewDrag() {
         const clientX = e.touches ? e.touches[0].clientX : e.clientX;
         const clientY = e.touches ? e.touches[0].clientY : e.clientY;
 
-        // Calculate movement deltas (inverted because we're using bottom/right)
-        const deltaX = startX - clientX;
+        // Calculate movement deltas
+        const deltaX = clientX - startX;
         const deltaY = clientY - startY;
 
         // Calculate new position
-        let newRight = startRight + deltaX;
-        let newBottom = startBottom - deltaY;
+        let newTop = startTop + deltaY;
+        let newLeft = startLeft + deltaX;
 
         // Constrain to viewport
         const rect = miniviewElement.getBoundingClientRect();
-        const maxRight = window.innerWidth - rect.width - 10;
-        const maxBottom = window.innerHeight - rect.height - 10;
+        const maxTop = window.innerHeight - rect.height - 10;
+        const maxLeft = window.innerWidth - rect.width - 10;
 
-        newRight = Math.max(10, Math.min(newRight, maxRight));
-        newBottom = Math.max(10, Math.min(newBottom, maxBottom));
+        newTop = Math.max(10, Math.min(newTop, maxTop));
+        newLeft = Math.max(10, Math.min(newLeft, maxLeft));
 
-        // Apply new position
-        miniviewElement.style.right = `${newRight}px`;
-        miniviewElement.style.bottom = `${newBottom}px`;
+        // Apply new position using top/left
+        miniviewElement.style.top = `${newTop}px`;
+        miniviewElement.style.left = `${newLeft}px`;
+        miniviewElement.style.bottom = 'auto';
+        miniviewElement.style.right = 'auto';
     };
 
     const onMouseUp = () => {
@@ -2527,8 +2611,8 @@ function setupMiniviewDrag() {
         isDragging = false;
         header.style.cursor = 'grab';
 
-        // Save position to settings
-        const style = window.getComputedStyle(miniviewElement);
+        // Save position to settings (convert to bottom/right for backward compatibility)
+        const rect = miniviewElement.getBoundingClientRect();
         const settings = getSettings();
         if (!settings.miniview) {
             settings.miniview = { pinned: false, mode: 'session', position: {} };
@@ -2536,8 +2620,9 @@ function setupMiniviewDrag() {
         if (!settings.miniview.position) {
             settings.miniview.position = {};
         }
-        settings.miniview.position.bottom = parseInt(style.bottom, 10) || 80;
-        settings.miniview.position.right = parseInt(style.right, 10) || 20;
+        // Save as bottom/right for compatibility with existing settings format
+        settings.miniview.position.bottom = Math.round(window.innerHeight - rect.bottom);
+        settings.miniview.position.right = Math.round(window.innerWidth - rect.right);
         saveSettings();
     };
 
@@ -3074,7 +3159,11 @@ function createSettingsUI() {
     let resizeTimeout;
     window.addEventListener('resize', () => {
         clearTimeout(resizeTimeout);
-        resizeTimeout = setTimeout(renderChart, 100);
+        resizeTimeout = setTimeout(() => {
+            renderChart();
+            // Also reposition miniview to keep it within bounds
+            debouncedMiniviewResize();
+        }, 100);
     });
 }
 
