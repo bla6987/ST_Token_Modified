@@ -1675,14 +1675,13 @@ function renderChart() {
         // Bar rendering - fill segments with model colors
         const r = Math.min(3, barWidth / 4);
         const h = Math.max(0, barH);
-        const w = barWidth;
 
         // Build the outer bar path (with rounded top corners)
         let outerPathD;
         if (h < r * 2) {
-            outerPathD = `M ${barX},${barY + h} v-${h} h${w} v${h} z`;
+            outerPathD = `M ${barX},${barY + h} v-${h} h${barWidth} v${h} z`;
         } else {
-            outerPathD = `M ${barX},${barY + h} v-${h - r} a${r},${r} 0 0 1 ${r},-${r} h${w - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${h - r} z`;
+            outerPathD = `M ${barX},${barY + h} v-${h - r} a${r},${r} 0 0 1 ${r},-${r} h${barWidth - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${h - r} z`;
         }
 
         // Draw filled segments for each model
@@ -1705,16 +1704,16 @@ function renderChart() {
 
                 if (segmentHeight < r * 2) {
                     // Too small for rounded corners
-                    segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight} h${w} v${segmentHeight} z`;
+                    segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight} h${barWidth} v${segmentHeight} z`;
                 } else if (isTop && isBottom) {
                     // Only segment - round top corners
-                    segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight - r} a${r},${r} 0 0 1 ${r},-${r} h${w - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${segmentHeight - r} z`;
+                    segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight - r} a${r},${r} 0 0 1 ${r},-${r} h${barWidth - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${segmentHeight - r} z`;
                 } else if (isTop) {
                     // Top segment - round top corners only
-                    segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight - r} a${r},${r} 0 0 1 ${r},-${r} h${w - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${segmentHeight - r} z`;
+                    segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight - r} a${r},${r} 0 0 1 ${r},-${r} h${barWidth - 2 * r} a${r},${r} 0 0 1 ${r},${r} v${segmentHeight - r} z`;
                 } else {
                     // Bottom or middle segment - no rounding
-                    segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight} h${w} v${segmentHeight} z`;
+                    segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight} h${barWidth} v${segmentHeight} z`;
                 }
 
                 const color = getModelColor(modelId);
