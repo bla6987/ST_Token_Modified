@@ -188,10 +188,15 @@ function loadSettings() {
         }
     }
 
-    // Initialize session start time
-    if (!settings.usage.session.startTime) {
-        settings.usage.session.startTime = getCurrentEasternTime().toISOString();
-    }
+    // Always reset session on page load - session should not persist across reloads
+    settings.usage.session = {
+        input: 0,
+        output: 0,
+        reasoning: 0,
+        total: 0,
+        messageCount: 0,
+        startTime: getCurrentEasternTime().toISOString(),
+    };
 
     return settings;
 }
@@ -227,16 +232,27 @@ function getHourKey(date = getCurrentEasternTime()) {
 }
 
 /**
- * Get the current week key (YYYY-WNN)
+ * Get the current week key (YYYY-WNN) using ISO 8601 week numbering
+ * ISO 8601: Week 1 is the week containing the first Thursday of the year
  */
 function getWeekKey(date = getCurrentEasternTime()) {
     const { year, month, day } = getEasternParts(date);
-    // Week calculation is based on the Eastern calendar date, but done in UTC for consistency.
-    const easternCalendarDateUtc = new Date(Date.UTC(year, month - 1, day));
-    const startOfYearUtc = new Date(Date.UTC(year, 0, 1));
-    const days = Math.floor((easternCalendarDateUtc.getTime() - startOfYearUtc.getTime()) / (24 * 60 * 60 * 1000));
-    const weekNumber = Math.ceil((days + startOfYearUtc.getUTCDay() + 1) / 7);
-    return `${year}-W${String(weekNumber).padStart(2, '0')}`;
+    // Create date in UTC for consistent calculation
+    const d = new Date(Date.UTC(year, month - 1, day));
+    
+    // ISO 8601: Week starts on Monday (day 1), Sunday is day 7
+    // Set to nearest Thursday: current date + 4 - current day number (makes Sunday = 7)
+    const dayNum = d.getUTCDay() || 7; // Convert Sunday from 0 to 7
+    d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+    
+    // Get first day of the year for the Thursday's year (may differ from input year at boundaries)
+    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    
+    // Calculate week number: how many weeks between yearStart and the Thursday
+    const weekNumber = Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+    
+    // Use the year of the Thursday (handles year boundary cases correctly)
+    return `${d.getUTCFullYear()}-W${String(weekNumber).padStart(2, '0')}`;
 }
 
 /**
@@ -526,6 +542,7 @@ function resetSession() {
     settings.usage.session = {
         input: 0,
         output: 0,
+        reasoning: 0,
         total: 0,
         messageCount: 0,
         startTime: getCurrentEasternTime().toISOString(),
@@ -634,6 +651,8 @@ let pendingModelId = null;
 let pendingSourceId = null;
 // For 'continue' type generations, track the pre-continue token count so we can compute the delta
 let preContinueTokenCount = 0;
+/** @type {Promise<number>|null} Promise that resolves to pre-continue token count */
+let pendingPreContinuePromise = null;
 
 /**
  * Count input tokens from the full prompt context (async helper)
@@ -771,7 +790,7 @@ function handleGenerationStarted(type, params, isDryRun) {
     preContinueTokenCount = 0;
 
     // For continue type, capture the current message's token count
-    // IMPORTANT: Do NOT await here - this handler must be non-blocking to avoid freezing the UI
+    // Store a promise that will resolve to the pre-continue token count
     if (type === 'continue') {
         try {
             const context = getContext();
@@ -781,19 +800,21 @@ function handleGenerationStarted(type, params, isDryRun) {
                 // Use existing token count if available (synchronous - fast path)
                 if (lastMessage.extra?.token_count && typeof lastMessage.extra.token_count === 'number') {
                     preContinueTokenCount = lastMessage.extra.token_count;
+                    pendingPreContinuePromise = Promise.resolve(lastMessage.extra.token_count);
                 } else {
-                    // Calculate it ourselves - schedule async but don't block
-                    // We use a promise to capture the count before message handling needs it
-                    (async () => {
+                    // Calculate it ourselves - store as a promise so we can await it later
+                    pendingPreContinuePromise = (async () => {
                         try {
                             let tokens = await countTokens(lastMessage.mes || '');
                             if (lastMessage.extra?.reasoning) {
                                 tokens += await countTokens(lastMessage.extra.reasoning);
                             }
                             preContinueTokenCount = tokens;
+                            return tokens;
                         } catch (error) {
                             console.error('[Token Usage Tracker] Error calculating pre-continue tokens:', error);
                             preContinueTokenCount = 0;
+                            return 0;
                         }
                     })();
                 }
@@ -801,6 +822,7 @@ function handleGenerationStarted(type, params, isDryRun) {
         } catch (error) {
             console.error('[Token Usage Tracker] Error capturing pre-continue state:', error);
             preContinueTokenCount = 0;
+            pendingPreContinuePromise = Promise.resolve(0);
         }
     }
 }
@@ -862,15 +884,23 @@ async function handleMessageReceived(messageIndex, type) {
 
         // For 'continue' type, we only want the newly generated tokens, not the full message
         // Subtract the pre-continue token count to get just the delta
-        if (type === 'continue' && preContinueTokenCount > 0) {
-            const originalOutputTokens = outputTokens;
-            outputTokens = Math.max(0, outputTokens - preContinueTokenCount);
-            console.log(`[Token Usage Tracker] Continue type: ${originalOutputTokens} total - ${preContinueTokenCount} pre-continue = ${outputTokens} new tokens`);
+        // Await the promise to ensure the async calculation has completed
+        if (type === 'continue') {
+            if (pendingPreContinuePromise) {
+                preContinueTokenCount = await pendingPreContinuePromise;
+                pendingPreContinuePromise = null;
+            }
+            if (preContinueTokenCount > 0) {
+                const originalOutputTokens = outputTokens;
+                outputTokens = Math.max(0, outputTokens - preContinueTokenCount);
+                console.log(`[Token Usage Tracker] Continue type: ${originalOutputTokens} total - ${preContinueTokenCount} pre-continue = ${outputTokens} new tokens`);
+            }
         }
 
         // Reset pre-continue state
         const savedPreContinueCount = preContinueTokenCount;
         preContinueTokenCount = 0;
+        pendingPreContinuePromise = null;
 
         // Await the input token counting that was started in handleGenerateAfterData
         const inputTokens = await pendingInputTokensPromise;
@@ -1411,46 +1441,71 @@ function importUsageData(jsonString) {
 
     const settings = getSettings();
 
-    // Import usage data (merge with existing)
+    // Import usage data (replace, not merge, to avoid doubling stats)
     if (data.usage.session) {
         // Don't import session data - it's ephemeral
     }
 
-    // Merge byDay data
+    // Replace byDay data (overwrite existing days to prevent doubling)
     if (data.usage.byDay) {
         for (const [dayKey, dayData] of Object.entries(data.usage.byDay)) {
-            if (!settings.usage.byDay[dayKey]) {
-                settings.usage.byDay[dayKey] = dayData;
-            } else {
-                // Merge: add tokens if day already exists
-                settings.usage.byDay[dayKey].input += dayData.input || 0;
-                settings.usage.byDay[dayKey].output += dayData.output || 0;
-                settings.usage.byDay[dayKey].total += dayData.total || 0;
-                settings.usage.byDay[dayKey].messageCount += dayData.messageCount || 0;
-            }
+            settings.usage.byDay[dayKey] = dayData;
         }
     }
 
-    // Merge byHour data
+    // Replace byHour data (overwrite existing hours to prevent doubling)
     if (data.usage.byHour) {
         for (const [hourKey, hourData] of Object.entries(data.usage.byHour)) {
-            if (!settings.usage.byHour[hourKey]) {
-                settings.usage.byHour[hourKey] = hourData;
-            } else {
-                settings.usage.byHour[hourKey].input += hourData.input || 0;
-                settings.usage.byHour[hourKey].output += hourData.output || 0;
-                settings.usage.byHour[hourKey].total += hourData.total || 0;
-                settings.usage.byHour[hourKey].messageCount += hourData.messageCount || 0;
-            }
+            settings.usage.byHour[hourKey] = hourData;
         }
     }
 
-    // Merge model prices (overwrite existing)
+    // Replace byWeek data
+    if (data.usage.byWeek) {
+        for (const [weekKey, weekData] of Object.entries(data.usage.byWeek)) {
+            settings.usage.byWeek[weekKey] = weekData;
+        }
+    }
+
+    // Replace byMonth data
+    if (data.usage.byMonth) {
+        for (const [monthKey, monthData] of Object.entries(data.usage.byMonth)) {
+            settings.usage.byMonth[monthKey] = monthData;
+        }
+    }
+
+    // Replace byChat data
+    if (data.usage.byChat) {
+        for (const [chatId, chatData] of Object.entries(data.usage.byChat)) {
+            settings.usage.byChat[chatId] = chatData;
+        }
+    }
+
+    // Replace byModel data
+    if (data.usage.byModel) {
+        for (const [modelId, modelData] of Object.entries(data.usage.byModel)) {
+            settings.usage.byModel[modelId] = modelData;
+        }
+    }
+
+    // Replace bySource data
+    if (data.usage.bySource) {
+        for (const [sourceId, sourceData] of Object.entries(data.usage.bySource)) {
+            settings.usage.bySource[sourceId] = sourceData;
+        }
+    }
+
+    // Replace allTime data
+    if (data.usage.allTime) {
+        settings.usage.allTime = data.usage.allTime;
+    }
+
+    // Replace model prices (overwrite existing)
     if (data.modelPrices) {
         Object.assign(settings.modelPrices, data.modelPrices);
     }
 
-    // Merge model colors (overwrite existing)
+    // Replace model colors (overwrite existing)
     if (data.modelColors) {
         Object.assign(settings.modelColors, data.modelColors);
     }
@@ -1460,7 +1515,7 @@ function importUsageData(jsonString) {
 
     return {
         success: true,
-        message: `Import successful. Merged data from ${data.exportDate || 'unknown date'}.`
+        message: `Import successful. Replaced data from ${data.exportDate || 'unknown date'}.`
     };
 }
 
@@ -3481,14 +3536,13 @@ async function handleBackgroundGeneration(originalFn, context, args, inputCounte
 jQuery(async () => {
     console.log('[Token Usage Tracker] Initializing...');
 
-    // Sync time with external source on startup
-    syncTimeOffset().then(success => {
-        if (success) {
-            console.log('[Token Usage Tracker] External time sync successful');
-        } else {
-            console.log('[Token Usage Tracker] Using local time with Eastern timezone conversion');
-        }
-    });
+    // Sync time with external source on startup (blocking to ensure consistent timestamps)
+    const timeSyncSuccess = await syncTimeOffset();
+    if (timeSyncSuccess) {
+        console.log('[Token Usage Tracker] External time sync successful');
+    } else {
+        console.log('[Token Usage Tracker] Using local time with Eastern timezone conversion');
+    }
 
     loadSettings();
     registerSlashCommands();
