@@ -114,6 +114,11 @@ const defaultSettings = {
     modelColors: {}, // { "gpt-4o": "#6366f1", "claude-3-opus": "#8b5cf6", ... }
     // Prices per 1M tokens: { "gpt-4o": { in: 2.5, out: 10 }, ... }
     modelPrices: {},
+    // OpenRouter auto-fetched pricing cache
+    openRouterPrices: {
+        data: {},         // { "model-id": { prompt: X, completion: Y } } - per-token pricing
+        lastFetched: null // Timestamp of last API fetch
+    },
     // Miniview settings
     miniview: {
         pinned: false,
@@ -298,6 +303,82 @@ function getCurrentSourceId() {
         return oai_settings.chat_completion_source;
     }
     return main_api || 'unknown';
+}
+
+// OpenRouter pricing cache duration (24 hours in ms)
+const OPENROUTER_CACHE_DURATION = 24 * 60 * 60 * 1000;
+
+/**
+ * Fetch model pricing from OpenRouter's public API
+ * Stores pricing in settings.openRouterPrices cache
+ * @returns {Promise<boolean>} True if fetch was successful
+ */
+async function fetchOpenRouterPricing() {
+    try {
+        console.log('[Token Usage Tracker] Fetching OpenRouter model pricing...');
+
+        const response = await fetch('https://openrouter.ai/api/v1/models');
+        if (!response.ok) {
+            console.warn('[Token Usage Tracker] OpenRouter API returned status:', response.status);
+            return false;
+        }
+
+        const data = await response.json();
+        if (!data.data || !Array.isArray(data.data)) {
+            console.warn('[Token Usage Tracker] Unexpected OpenRouter API response format');
+            return false;
+        }
+
+        const settings = getSettings();
+        if (!settings.openRouterPrices) {
+            settings.openRouterPrices = { data: {}, lastFetched: null };
+        }
+
+        // Parse and store pricing for each model
+        const pricingData = {};
+        for (const model of data.data) {
+            if (model.id && model.pricing) {
+                pricingData[model.id] = {
+                    prompt: model.pricing.prompt || '0',
+                    completion: model.pricing.completion || '0'
+                };
+            }
+        }
+
+        settings.openRouterPrices.data = pricingData;
+        settings.openRouterPrices.lastFetched = Date.now();
+        saveSettings();
+
+        console.log(`[Token Usage Tracker] Cached pricing for ${Object.keys(pricingData).length} OpenRouter models`);
+        return true;
+    } catch (error) {
+        console.warn('[Token Usage Tracker] Failed to fetch OpenRouter pricing:', error);
+        return false;
+    }
+}
+
+/**
+ * Conditionally fetch OpenRouter pricing if:
+ * 1. Current source is 'openrouter'
+ * 2. Cache is empty or older than 24 hours
+ * @returns {Promise<void>}
+ */
+async function maybeAutoFetchOpenRouterPricing() {
+    const currentSource = getCurrentSourceId();
+
+    // Only fetch if using OpenRouter
+    if (currentSource !== 'openrouter') {
+        return;
+    }
+
+    const settings = getSettings();
+    const lastFetched = settings.openRouterPrices?.lastFetched;
+    const now = Date.now();
+
+    // Check if cache is stale (>24 hours old) or empty
+    if (!lastFetched || (now - lastFetched) > OPENROUTER_CACHE_DURATION) {
+        await fetchOpenRouterPricing();
+    }
 }
 
 /**
@@ -678,6 +759,9 @@ let isImpersonateGeneration = false;
 
 function handleGenerationStarted(type, params, isDryRun) {
     if (isDryRun) return;
+
+    // Check if we need to fetch OpenRouter pricing (fire and forget)
+    maybeAutoFetchOpenRouterPricing();
 
     // Track the generation type for special handling
     isQuietGeneration = (type === 'quiet');
@@ -1204,12 +1288,29 @@ function setModelColor(modelId, color) {
 
 /**
  * Get price settings for a model
+ * Priority: 1) User-defined price, 2) OpenRouter cache, 3) Default zeros
  * @param {string} modelId
  * @returns {{in: number, out: number}} Price per 1M tokens
  */
 function getModelPrice(modelId) {
     const settings = getSettings();
-    return settings.modelPrices[modelId] || { in: 0, out: 0 };
+
+    // User-defined prices take priority
+    if (settings.modelPrices[modelId]) {
+        return settings.modelPrices[modelId];
+    }
+
+    // Auto-populated from OpenRouter cache (if available)
+    const orPrice = settings.openRouterPrices?.data?.[modelId];
+    if (orPrice) {
+        // OpenRouter returns price per token, convert to per 1M tokens
+        return {
+            in: (parseFloat(orPrice.prompt) || 0) * 1000000,
+            out: (parseFloat(orPrice.completion) || 0) * 1000000
+        };
+    }
+
+    return { in: 0, out: 0 };
 }
 
 /**
@@ -3392,6 +3493,9 @@ jQuery(async () => {
     loadSettings();
     registerSlashCommands();
     createSettingsUI();
+
+    // Auto-fetch OpenRouter pricing if using OpenRouter API
+    maybeAutoFetchOpenRouterPricing();
 
     // Attempt to patch background generation functions
     patchBackgroundGenerations();
