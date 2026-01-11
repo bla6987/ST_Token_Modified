@@ -1951,7 +1951,29 @@ function renderChartByType() {
 function showTooltip(d) {
     if (!tooltip) return;
 
-    // Build model breakdown HTML
+    // Calculate total cost for this timeframe
+    let totalCost = 0;
+    let modelCosts = {};
+
+    if (d.models && Object.keys(d.models).length > 0) {
+        for (const [model, modelData] of Object.entries(d.models)) {
+            // Extract input/output from new object format, estimate for legacy number format
+            let inputTokens, outputTokens;
+            if (typeof modelData === 'number') {
+                // Legacy format: estimate 50/50 split
+                inputTokens = Math.round(modelData * 0.5);
+                outputTokens = Math.round(modelData * 0.5);
+            } else {
+                inputTokens = modelData.input || 0;
+                outputTokens = modelData.output || 0;
+            }
+            const cost = calculateCost(inputTokens, outputTokens, model);
+            modelCosts[model] = cost;
+            totalCost += cost;
+        }
+    }
+
+    // Build model breakdown HTML with costs
     let modelBreakdown = '';
     if (d.models && Object.keys(d.models).length > 0) {
         // Extract total from new object format or use number directly for legacy
@@ -1964,12 +1986,14 @@ function showTooltip(d) {
             const percent = d.usage > 0 ? Math.round((tokens / d.usage) * 100) : 0;
             const shortName = model.length > 25 ? model.substring(0, 22) + '...' : model;
             const color = getModelColor(model);
+            const modelCost = modelCosts[model] || 0;
+            const costDisplay = modelCost > 0 ? ` · $${modelCost.toFixed(4)}` : '';
             modelBreakdown += `<div style="font-size: 9px; color: rgba(255,255,255,0.5); display: flex; align-items: center; justify-content: space-between; gap: 8px;">
                 <div style="display: flex; align-items: center; gap: 4px; min-width: 0;">
                     <span style="display: inline-block; width: 8px; height: 8px; background: ${color}; border-radius: 2px; flex-shrink: 0;"></span>
                     <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${shortName}</span>
                 </div>
-                <span style="flex-shrink: 0;">${formatTokens(tokens)} (${percent}%)</span>
+                <span style="flex-shrink: 0;">${formatTokens(tokens)} (${percent}%)${costDisplay}</span>
             </div>`;
         }
         if (modelEntries.length > 8) {
@@ -1978,10 +2002,16 @@ function showTooltip(d) {
         modelBreakdown += '</div>';
     }
 
+    // Build cost display line
+    const costLine = totalCost > 0
+        ? `<div style="font-size: 10px; color: #4ade80; font-weight: 500;">Cost: $${totalCost.toFixed(4)}</div>`
+        : '';
+
     tooltip.innerHTML = `
         <div style="font-weight: 600; margin-bottom: 2px; color: var(--SmartThemeBodyColor);">${d.fullDate}</div>
         <div style="color: var(--SmartThemeBodyColor);">${formatNumberFull(d.usage)} tokens</div>
         <div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.6;">${formatNumberFull(d.input)} in / ${formatNumberFull(d.output)} out</div>
+        ${costLine}
         ${modelBreakdown}
     `;
     tooltip.style.display = 'block';
