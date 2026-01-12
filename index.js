@@ -239,18 +239,18 @@ function getWeekKey(date = getCurrentEasternTime()) {
     const { year, month, day } = getEasternParts(date);
     // Create date in UTC for consistent calculation
     const d = new Date(Date.UTC(year, month - 1, day));
-    
+
     // ISO 8601: Week starts on Monday (day 1), Sunday is day 7
     // Set to nearest Thursday: current date + 4 - current day number (makes Sunday = 7)
     const dayNum = d.getUTCDay() || 7; // Convert Sunday from 0 to 7
     d.setUTCDate(d.getUTCDate() + 4 - dayNum);
-    
+
     // Get first day of the year for the Thursday's year (may differ from input year at boundaries)
     const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-    
+
     // Calculate week number: how many weeks between yearStart and the Thursday
     const weekNumber = Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
-    
+
     // Use the year of the Thursday (handles year boundary cases correctly)
     return `${d.getUTCFullYear()}-W${String(weekNumber).padStart(2, '0')}`;
 }
@@ -507,8 +507,20 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, s
 
     // By chat
     if (chatId) {
-        if (!usage.byChat[chatId]) usage.byChat[chatId] = { input: 0, output: 0, total: 0, messageCount: 0 };
+        if (!usage.byChat[chatId]) usage.byChat[chatId] = { input: 0, output: 0, total: 0, messageCount: 0, models: {} };
         addTokens(usage.byChat[chatId]);
+
+        // Track model within chat for cost calculation
+        if (modelId) {
+            if (!usage.byChat[chatId].models) usage.byChat[chatId].models = {};
+            if (!usage.byChat[chatId].models[modelId]) {
+                usage.byChat[chatId].models[modelId] = { input: 0, output: 0, total: 0 };
+            }
+            const chatModelData = usage.byChat[chatId].models[modelId];
+            chatModelData.input += inputTokens;
+            chatModelData.output += outputTokens;
+            chatModelData.total += totalTokens;
+        }
     }
 
     // By model (aggregate)
@@ -2442,16 +2454,28 @@ function updateChatUsageDisplay() {
         $('#token-usage-chat-messages').text('0');
         $('#token-usage-chat-input').text('0');
         $('#token-usage-chat-output').text('0');
+        $('#token-usage-chat-cost').text('$0.00');
         $('#token-usage-chat-id').text('No chat active');
         return;
     }
 
     const chatUsage = getChatUsage(chatId);
 
+    // Calculate chat cost from per-model usage
+    let chatCost = 0;
+    if (chatUsage.models) {
+        for (const [mid, modelData] of Object.entries(chatUsage.models)) {
+            const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
+            const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+            chatCost += calculateCost(mInput, mOutput, mid);
+        }
+    }
+
     $('#token-usage-chat-total').text(formatTokens(chatUsage.total));
     $('#token-usage-chat-messages').text(chatUsage.messageCount);
     $('#token-usage-chat-input').text(formatTokens(chatUsage.input));
     $('#token-usage-chat-output').text(formatTokens(chatUsage.output));
+    $('#token-usage-chat-cost').text(`$${chatCost.toFixed(2)}`);
     $('#token-usage-chat-id').text(`Chat: ${chatId}`);
 }
 
@@ -3207,6 +3231,10 @@ function createSettingsUI() {
                                     <div>
                                         <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Output</div>
                                         <div style="font-size: 12px; color: var(--SmartThemeBodyColor);" id="token-usage-chat-output">0</div>
+                                    </div>
+                                    <div>
+                                        <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Cost</div>
+                                        <div style="font-size: 12px; color: var(--SmartThemeBodyColor);" id="token-usage-chat-cost">$0.00</div>
                                     </div>
                                 </div>
                                 <div style="margin-top: 6px; font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;" id="token-usage-chat-id">No chat active</div>
