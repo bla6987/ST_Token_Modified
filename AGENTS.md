@@ -1,1 +1,1 @@
-The project name inside the Sillytavern UI is "Token Usage Tracker". The project is synced to github at https://github.com/bla6987/ST_Token_Modified. Make sure to update the github repository when you make changes to the project.
+The project name inside the Sillytavern UI is "Token Usage Tracker". The project is synced to github at https://github.com/bla6987/ST_Token_Modified. Make sure to update the github repository when you make changes to the project. 

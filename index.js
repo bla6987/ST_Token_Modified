@@ -1330,7 +1330,7 @@ function setModelColor(modelId, color) {
 
 /**
  * Get price settings for a model
- * Priority: 1) User-defined price, 2) OpenRouter cache, 3) Default zeros
+ * Priority: 1) User-defined price, 2) OpenRouter cache (exact), 3) OpenRouter cache (suffix match), 4) Default zeros
  * @param {string} modelId
  * @returns {{in: number, out: number}} Price per 1M tokens
  */
@@ -1342,7 +1342,7 @@ function getModelPrice(modelId) {
         return settings.modelPrices[modelId];
     }
 
-    // Auto-populated from OpenRouter cache (if available)
+    // Auto-populated from OpenRouter cache - try exact match first
     const orPrice = settings.openRouterPrices?.data?.[modelId];
     if (orPrice) {
         // OpenRouter returns price per token, convert to per 1M tokens
@@ -1350,6 +1350,34 @@ function getModelPrice(modelId) {
             in: (parseFloat(orPrice.prompt) || 0) * 1000000,
             out: (parseFloat(orPrice.completion) || 0) * 1000000
         };
+    }
+
+    // Fallback: Check if the end of modelId matches any key in OpenRouter price data (case-insensitive)
+    if (settings.openRouterPrices?.data) {
+        const modelIdLower = modelId.toLowerCase();
+
+        // Find the longest matching suffix to prefer more specific matches
+        let bestMatch = null;
+        let bestMatchLength = 0;
+
+        for (const priceKey of Object.keys(settings.openRouterPrices.data)) {
+            const priceKeyLower = priceKey.toLowerCase();
+
+            // Check if modelId ends with this price key
+            if (modelIdLower.endsWith(priceKeyLower) && priceKeyLower.length > bestMatchLength) {
+                bestMatch = priceKey;
+                bestMatchLength = priceKeyLower.length;
+            }
+        }
+
+        if (bestMatch) {
+            const matchedPrice = settings.openRouterPrices.data[bestMatch];
+            console.log(`[Token Usage Tracker] Model "${modelId}" matched to OpenRouter pricing for "${bestMatch}" via suffix match`);
+            return {
+                in: (parseFloat(matchedPrice.prompt) || 0) * 1000000,
+                out: (parseFloat(matchedPrice.completion) || 0) * 1000000
+            };
+        }
     }
 
     return { in: 0, out: 0 };
