@@ -1743,6 +1743,72 @@ function getChartDataForGranularity() {
 }
 
 /**
+ * Get usage totals for the selected range (in days)
+ * @param {number} rangeDays
+ * @param {string} sourceFilter
+ */
+function getRangeTotals(rangeDays, sourceFilter = 'all') {
+    const settings = getSettings();
+    const byDay = settings.usage.byDay || {};
+    const now = getCurrentEasternTime();
+    const totals = { input: 0, output: 0, reasoning: 0, total: 0, cost: 0 };
+
+    for (let i = 0; i < rangeDays; i++) {
+        const date = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
+        const dayKey = getDayKey(date);
+        const dayData = byDay[dayKey];
+        if (!dayData) continue;
+
+        if (sourceFilter !== 'all') {
+            const sourceData = dayData.sources ? dayData.sources[sourceFilter] : null;
+            if (!sourceData) continue;
+            totals.input += sourceData.input || 0;
+            totals.output += sourceData.output || 0;
+            totals.total += sourceData.total || 0;
+
+            if (sourceData.models) {
+                for (const [mid, modelData] of Object.entries(sourceData.models)) {
+                    const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
+                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                    totals.cost += calculateCost(mInput, mOutput, mid);
+                }
+            }
+            continue;
+        }
+
+        totals.input += dayData.input || 0;
+        totals.output += dayData.output || 0;
+        totals.reasoning += dayData.reasoning || 0;
+        totals.total += dayData.total || 0;
+
+        if (dayData.models) {
+            for (const [mid, modelData] of Object.entries(dayData.models)) {
+                const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
+                const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                totals.cost += calculateCost(mInput, mOutput, mid);
+            }
+        }
+    }
+
+    return totals;
+}
+
+/**
+ * Update the header summary to reflect the selected chart range
+ */
+function updateRangeSummary() {
+    const totals = getRangeTotals(currentChartRange, currentSourceFilter);
+    const label = currentChartRange === 1 ? 'today' : `last ${currentChartRange} days`;
+
+    $('#token-usage-today-total').text(formatTokens(totals.total));
+    $('#token-usage-today-in').text(formatTokens(totals.input || 0));
+    $('#token-usage-today-out').text(formatTokens(totals.output || 0));
+    $('#token-usage-today-reasoning').text(formatTokens(totals.reasoning || 0));
+    $('#token-usage-today-cost').text(`$${totals.cost.toFixed(2)}`);
+    $('#token-usage-range-label').text(label);
+}
+
+/**
  * Render the bar chart
  */
 function renderChart() {
@@ -2252,6 +2318,7 @@ function updateChartRange(range) {
     currentChartRange = range;
     chartData = getChartDataForGranularity();
     renderChartByType();
+    updateRangeSummary();
 
     document.querySelectorAll('.token-usage-range-btn').forEach(btn => {
         const val = parseInt(btn.getAttribute('data-value'));
@@ -2270,6 +2337,7 @@ function updateSourceFilter(sourceId) {
     currentSourceFilter = sourceId;
     chartData = getChartDataForGranularity();
     renderChartByType();
+    updateRangeSummary();
     updateUIStats();
 }
 
@@ -2341,10 +2409,6 @@ function updateUIStats() {
     const now = getCurrentEasternTime();
 
     // Today header
-    $('#token-usage-today-total').text(formatTokens(stats.today.total));
-    $('#token-usage-today-in').text(formatTokens(stats.today.input || 0));
-    $('#token-usage-today-out').text(formatTokens(stats.today.output || 0));
-    $('#token-usage-today-reasoning').text(formatTokens(stats.today.reasoning || 0));
     $('#token-usage-mini-counter').text(formatTokens(stats.today.total));
 
     // Stats grid
@@ -2423,6 +2487,9 @@ function updateUIStats() {
     // Update chart data with current granularity and source filter
     chartData = getChartDataForGranularity();
     renderChartByType();
+
+    // Update the range-based header summary
+    updateRangeSummary();
 
     // Update source dropdown options (in case new sources were added)
     updateSourceDropdown();
@@ -3135,7 +3202,7 @@ function createSettingsUI() {
                             <div style="display: flex; align-items: baseline; gap: 6px;">
                                 <span style="font-size: 18px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-today-total">${formatTokens(stats.today.total)}</span>
                                 <span id="token-usage-today-cost" style="font-size: 12px; color: var(--SmartThemeBodyColor); opacity: 0.8;">$0.00</span>
-                                <span style="font-size: 11px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> today</span>
+                                <span id="token-usage-range-label" style="font-size: 11px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> today</span>
                             </div>
                             <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;">
                                 <span id="token-usage-today-in">${formatTokens(stats.today.input || 0)}</span> in /
