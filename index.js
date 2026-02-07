@@ -128,7 +128,7 @@ const defaultSettings = {
     },
     // Accumulated usage data
     usage: {
-        session: { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, startTime: null },
+        session: { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, models: {}, startTime: null },
         allTime: { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0 },
         // Time-based buckets: { "2025-01-15": { input: X, output: Y, total: Z, models: { "gpt-4o": 500, ... } }, ... }
         byDay: {},
@@ -195,6 +195,7 @@ function loadSettings() {
         reasoning: 0,
         total: 0,
         messageCount: 0,
+        models: {},
         startTime: getCurrentEasternTime().toISOString(),
     };
 
@@ -379,6 +380,16 @@ async function fetchOpenRouterPricing() {
  * 2. Cache is empty or older than 24 hours
  * @returns {Promise<void>}
  */
+/**
+ * Escape HTML special characters to prevent XSS
+ * @param {string} str - String to escape
+ * @returns {string} Escaped string
+ */
+function escapeHtml(str) {
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
 async function maybeAutoFetchOpenRouterPricing() {
     const currentSource = getCurrentSourceId();
 
@@ -423,12 +434,23 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, s
     // Session
     addTokens(usage.session);
 
+    // Track model within session for accurate cost calculation
+    if (modelId) {
+        if (!usage.session.models) usage.session.models = {};
+        if (!usage.session.models[modelId]) {
+            usage.session.models[modelId] = { input: 0, output: 0, total: 0 };
+        }
+        usage.session.models[modelId].input += inputTokens;
+        usage.session.models[modelId].output += outputTokens;
+        usage.session.models[modelId].total += totalTokens;
+    }
+
     // All-time
     addTokens(usage.allTime);
 
     // By day
     const dayKey = getDayKey(now);
-    if (!usage.byDay[dayKey]) usage.byDay[dayKey] = { input: 0, output: 0, total: 0, messageCount: 0, models: {}, sources: {} };
+    if (!usage.byDay[dayKey]) usage.byDay[dayKey] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, models: {}, sources: {} };
     addTokens(usage.byDay[dayKey]);
 
     // Track model within day for stacked chart (with input/output breakdown for cost calculation)
@@ -497,17 +519,17 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, s
 
     // By week
     const weekKey = getWeekKey(now);
-    if (!usage.byWeek[weekKey]) usage.byWeek[weekKey] = { input: 0, output: 0, total: 0, messageCount: 0 };
+    if (!usage.byWeek[weekKey]) usage.byWeek[weekKey] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0 };
     addTokens(usage.byWeek[weekKey]);
 
     // By month
     const monthKey = getMonthKey(now);
-    if (!usage.byMonth[monthKey]) usage.byMonth[monthKey] = { input: 0, output: 0, total: 0, messageCount: 0 };
+    if (!usage.byMonth[monthKey]) usage.byMonth[monthKey] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0 };
     addTokens(usage.byMonth[monthKey]);
 
     // By chat
     if (chatId) {
-        if (!usage.byChat[chatId]) usage.byChat[chatId] = { input: 0, output: 0, total: 0, messageCount: 0, models: {} };
+        if (!usage.byChat[chatId]) usage.byChat[chatId] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, models: {} };
         addTokens(usage.byChat[chatId]);
 
         // Track model within chat for cost calculation
@@ -525,13 +547,13 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, s
 
     // By model (aggregate)
     if (modelId) {
-        if (!usage.byModel[modelId]) usage.byModel[modelId] = { input: 0, output: 0, total: 0, messageCount: 0 };
+        if (!usage.byModel[modelId]) usage.byModel[modelId] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0 };
         addTokens(usage.byModel[modelId]);
     }
 
     // By source (aggregate)
     if (sourceId) {
-        if (!usage.bySource[sourceId]) usage.bySource[sourceId] = { input: 0, output: 0, total: 0, messageCount: 0 };
+        if (!usage.bySource[sourceId]) usage.bySource[sourceId] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0 };
         addTokens(usage.bySource[sourceId]);
     }
 
@@ -557,6 +579,7 @@ function resetSession() {
         reasoning: 0,
         total: 0,
         messageCount: 0,
+        models: {},
         startTime: getCurrentEasternTime().toISOString(),
     };
     saveSettings();
@@ -787,6 +810,7 @@ function handleGenerateAfterData(generate_data, dryRun) {
  */
 let isQuietGeneration = false;
 let isImpersonateGeneration = false;
+let pendingQuietOutput = null;
 
 function handleGenerationStarted(type, params, isDryRun) {
     if (isDryRun) return;
@@ -943,6 +967,7 @@ async function handleGenerationStopped() {
 
     try {
         let outputTokens = 0;
+        let reasoningTokens = 0;
 
         // Try to get partial output from the streaming processor
         if (streamingProcessor) {
@@ -952,10 +977,9 @@ async function handleGenerationStopped() {
                 console.log(`[Token Usage Tracker] Partial output from stopped generation: ${outputTokens} tokens`);
             }
 
-            // Also count any reasoning tokens that were generated
+            // Also count any reasoning tokens that were generated (tracked separately)
             if (streamingProcessor.reasoningHandler?.reasoning) {
-                const reasoningTokens = await countTokens(streamingProcessor.reasoningHandler.reasoning);
-                outputTokens += reasoningTokens;
+                reasoningTokens = await countTokens(streamingProcessor.reasoningHandler.reasoning);
                 console.log(`[Token Usage Tracker] Including ${reasoningTokens} partial reasoning tokens`);
             }
         }
@@ -972,9 +996,9 @@ async function handleGenerationStopped() {
         const chatId = getCurrentChatId();
 
         // Record the usage - input tokens were sent even if generation was stopped
-        recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId);
+        recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId, reasoningTokens);
 
-        console.log(`[Token Usage Tracker] Recorded stopped generation: ${inputTokens} in, ${outputTokens} out (partial), model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'}`);
+        console.log(`[Token Usage Tracker] Recorded stopped generation: ${inputTokens} in, ${outputTokens} out, ${reasoningTokens} reasoning (partial), model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'}`);
     } catch (error) {
         console.error('[Token Usage Tracker] Error handling stopped generation:', error);
         // Reset pending tokens even on error to prevent double counting
@@ -1215,6 +1239,8 @@ window['TokenUsageTracker'] = {
     resetAllUsage,
     recordUsage,
     countTokens, // Expose the token counting function
+    getCurrentModelId,
+    getCurrentSourceId,
     // Subscribe to updates
     onUpdate: (callback) => {
         eventSource.on('tokenUsageUpdated', callback);
@@ -1655,9 +1681,10 @@ function getChartData(days, sourceFilter = 'all') {
     const byDay = stats.byDay || {};
     const data = [];
     const today = getCurrentEasternTime();
+    const { year, month, day } = getEasternParts(today);
 
     for (let i = days - 1; i >= 0; i--) {
-        const date = new Date(today.getTime() - i * 24 * 60 * 60 * 1000);
+        const date = new Date(year, month - 1, day - i, 12, 0, 0);
         const dayKey = getDayKey(date);
         const dayData = byDay[dayKey] || { total: 0, input: 0, output: 0, models: {}, sources: {} };
 
@@ -1711,17 +1738,35 @@ function getHourlyChartData(hours, sourceFilter = 'all') {
     for (let i = hours - 1; i >= 0; i--) {
         const date = new Date(now.getTime() - i * 60 * 60 * 1000);
         const hourKey = getHourKey(date);
-        const hourData = byHour[hourKey] || { total: 0, input: 0, output: 0, messageCount: 0 };
+        const hourData = byHour[hourKey] || { total: 0, input: 0, output: 0, messageCount: 0, models: {}, sources: {} };
 
-        // For hourly data, we don't have per-source breakdown at hour level currently
-        // Use the raw hourly data
+        // Filter by source if specified
+        let usage, input, output, models;
+        if (sourceFilter !== 'all' && hourData.sources && hourData.sources[sourceFilter]) {
+            const sourceData = hourData.sources[sourceFilter];
+            usage = sourceData.total || 0;
+            input = sourceData.input || 0;
+            output = sourceData.output || 0;
+            models = {}; // No nested model data in hourly sources
+        } else if (sourceFilter !== 'all') {
+            usage = 0;
+            input = 0;
+            output = 0;
+            models = {};
+        } else {
+            usage = hourData.total || 0;
+            input = hourData.input || 0;
+            output = hourData.output || 0;
+            models = hourData.models || {};
+        }
+
         data.push({
             date: date,
             hourKey: hourKey,
-            usage: hourData.total || 0,
-            input: hourData.input || 0,
-            output: hourData.output || 0,
-            models: {},
+            usage: usage,
+            input: input,
+            output: output,
+            models: models,
             displayDate: new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, hour: 'numeric', hour12: true }).format(date),
             fullDate: new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', hour12: true }).format(date)
         });
@@ -1751,10 +1796,11 @@ function getRangeTotals(rangeDays, sourceFilter = 'all') {
     const settings = getSettings();
     const byDay = settings.usage.byDay || {};
     const now = getCurrentEasternTime();
+    const { year, month, day } = getEasternParts(now);
     const totals = { input: 0, output: 0, reasoning: 0, total: 0, cost: 0 };
 
     for (let i = 0; i < rangeDays; i++) {
-        const date = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
+        const date = new Date(year, month - 1, day - i, 12, 0, 0);
         const dayKey = getDayKey(date);
         const dayData = byDay[dayKey];
         if (!dayData) continue;
@@ -2246,7 +2292,7 @@ function showTooltip(d) {
         for (const [model, modelData] of displayEntries) {
             const tokens = getTokens(modelData);
             const percent = d.usage > 0 ? Math.round((tokens / d.usage) * 100) : 0;
-            const shortName = model.length > 25 ? model.substring(0, 22) + '...' : model;
+            const shortName = escapeHtml(model.length > 25 ? model.substring(0, 22) + '...' : model);
             const color = getModelColor(model);
             const modelCost = modelCosts[model] || 0;
             const costDisplay = modelCost > 0 ? ` · $${modelCost.toFixed(4)}` : '';
@@ -2389,7 +2435,7 @@ function updateSourceDropdown() {
 
     for (const source of sources) {
         const displayName = formatSourceName(source);
-        dropdown.append(`<option value="${source}">${displayName}</option>`);
+        dropdown.append(`<option value="${escapeHtml(source)}">${escapeHtml(displayName)}</option>`);
     }
 
     // Restore selection if still valid
@@ -2428,11 +2474,9 @@ function updateUIStats() {
     // For Week/Month: We iterate all `byDay` keys and match those that belong to current week/month
     const currentWeekKey = getWeekKey(now);
     const currentMonthKey = getMonthKey(now);
-    const todayKey = getDayKey(now);
 
     let weekCost = 0;
     let monthCost = 0;
-    let todayCost = 0;
 
     const settings = getSettings();
     for (const [dayKey, data] of Object.entries(settings.usage.byDay)) {
@@ -2449,11 +2493,7 @@ function updateUIStats() {
                     // modelData is now { input, output, total } (or number for legacy data)
                     const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
                     const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
-                    const cost = calculateCost(mInput, mOutput, mid);
-                    weekCost += cost;
-                    if (dayKey === todayKey) {
-                        todayCost += cost;
-                    }
+                    weekCost += calculateCost(mInput, mOutput, mid);
                 }
             }
         }
@@ -2471,7 +2511,6 @@ function updateUIStats() {
 
     $('#token-usage-week-cost').text(`$${weekCost.toFixed(2)}`);
     $('#token-usage-month-cost').text(`$${monthCost.toFixed(2)}`);
-    $('#token-usage-today-cost').text(`$${todayCost.toFixed(2)}`);
 
     $('#token-usage-tokenizer').text('Tokenizer: ' + (stats.tokenizer || 'Unknown'));
 
@@ -3055,11 +3094,13 @@ function updateMiniviewStats() {
     switch (mode) {
         case 'session':
             data = stats.session;
-            // Calculate session cost (rough estimate using current model prices)
-            // For simplicity, use the ratio of session to allTime
-            if (stats.allTime.total > 0) {
-                const allTimeCost = calculateAllTimeCost();
-                cost = allTimeCost * (stats.session.total / stats.allTime.total);
+            // Calculate session cost from per-model usage
+            if (settings.usage.session.models) {
+                for (const [mid, modelData] of Object.entries(settings.usage.session.models)) {
+                    const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
+                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                    cost += calculateCost(mInput, mOutput, mid);
+                }
             }
             break;
 
@@ -3140,15 +3181,16 @@ function renderModelColorsGrid() {
         const color = getModelColor(model);
         const prices = getModelPrice(model);
 
+        const safeModel = escapeHtml(model);
         const row = $(`
             <div class="model-config-row" style="display: flex; align-items: center; gap: 4px; min-width: 0;">
-                <input type="color" value="${color}" data-model="${model}"
+                <input type="color" value="${color}" data-model="${safeModel}"
                        class="model-color-picker"
                        style="width: 20px; height: 20px; padding: 0; border: none; cursor: pointer; flex-shrink: 0; border-radius: 4px;">
-                <span title="${model}" style="font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--SmartThemeBodyColor); flex: 1;">${model}</span>
+                <span title="${safeModel}" style="font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--SmartThemeBodyColor); flex: 1;">${safeModel}</span>
                 <span style="font-size: 8px; color: var(--SmartThemeBodyColor); opacity: 0.5; flex-shrink: 0;">Price</span>
-                <input type="number" class="price-input-in" data-model="${model}" value="${prices.in || ''}" step="0.01" min="0" placeholder="In" title="Price per 1M input tokens" style="width: 28px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
-                <input type="number" class="price-input-out" data-model="${model}" value="${prices.out || ''}" step="0.01" min="0" placeholder="Out" title="Price per 1M output tokens" style="width: 28px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
+                <input type="number" class="price-input-in" data-model="${safeModel}" value="${prices.in || ''}" step="0.01" min="0" placeholder="In" title="Price per 1M input tokens" style="width: 28px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
+                <input type="number" class="price-input-out" data-model="${safeModel}" value="${prices.out || ''}" step="0.01" min="0" placeholder="Out" title="Price per 1M output tokens" style="width: 28px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
             </div>
         `);
 
@@ -3469,7 +3511,7 @@ function createSettingsUI() {
     window.addEventListener('resize', () => {
         clearTimeout(resizeTimeout);
         resizeTimeout = setTimeout(() => {
-            renderChart();
+            renderChartByType();
             // Also reposition miniview to keep it within bounds
             debouncedMiniviewResize();
         }, 100);
@@ -3510,6 +3552,14 @@ function patchGenerateQuietPrompt() {
             });
         }
     });
+
+    // Eagerly capture streamingProcessor.result when a quiet generation stops,
+    // before the reference can be overwritten by a subsequent generation.
+    eventSource.on(event_types.GENERATION_STOPPED, () => {
+        if (isQuietGeneration && pendingInputTokensPromise && streamingProcessor?.result) {
+            pendingQuietOutput = streamingProcessor.result;
+        }
+    });
 }
 
 /**
@@ -3518,15 +3568,20 @@ function patchGenerateQuietPrompt() {
 async function flushQuietGeneration() {
     if (!pendingInputTokensPromise) return;
 
+    // Capture output synchronously before any await, so we read the correct
+    // streamingProcessor state (it may be overwritten by the next generation).
+    const capturedOutput = pendingQuietOutput || streamingProcessor?.result || null;
+    pendingQuietOutput = null;
+
     try {
         const inputTokens = await pendingInputTokensPromise;
         const modelId = pendingModelId;
         const sourceId = pendingSourceId;
 
-        // Try to get output from streaming processor
+        // Count output tokens from the captured result
         let outputTokens = 0;
-        if (streamingProcessor?.result) {
-            outputTokens = await countTokens(streamingProcessor.result);
+        if (capturedOutput) {
+            outputTokens = await countTokens(capturedOutput);
         }
 
         // Record the usage
@@ -3565,6 +3620,8 @@ function patchConnectionManager() {
                 }
 
                 let inputTokens = 0;
+                // Best-effort: captures the globally-selected model/source at call time.
+                // May not reflect the actual model used if the extension overrides it.
                 const modelId = getCurrentModelId();
                 const sourceId = getCurrentSourceId();
 
