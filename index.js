@@ -49,7 +49,9 @@ function getEasternParts(date) {
  */
 async function fetchExternalTime() {
     try {
-        const response = await fetch(`https://worldtimeapi.org/api/timezone/${EASTERN_TIMEZONE}`);
+        const response = await fetch(`https://worldtimeapi.org/api/timezone/${EASTERN_TIMEZONE}`, {
+            signal: AbortSignal.timeout(3000),
+        });
         if (!response.ok) {
             throw new Error(`HTTP ${response.status}`);
         }
@@ -3716,17 +3718,18 @@ async function handleBackgroundGeneration(originalFn, context, args, inputCounte
 jQuery(async () => {
     console.log('[Token Usage Tracker] Initializing...');
 
-    // Sync time with external source on startup (blocking to ensure consistent timestamps)
-    const timeSyncSuccess = await syncTimeOffset();
-    if (timeSyncSuccess) {
-        console.log('[Token Usage Tracker] External time sync successful');
-    } else {
-        console.log('[Token Usage Tracker] Using local time with Eastern timezone conversion');
-    }
-
     loadSettings();
     registerSlashCommands();
     createSettingsUI();
+
+    // Sync time with external source in background (non-blocking so UI appears immediately)
+    syncTimeOffset().then((success) => {
+        if (success) {
+            console.log('[Token Usage Tracker] External time sync successful');
+        } else {
+            console.log('[Token Usage Tracker] Using local time with Eastern timezone conversion');
+        }
+    });
 
     // Auto-fetch OpenRouter pricing if using OpenRouter API
     maybeAutoFetchOpenRouterPricing();
