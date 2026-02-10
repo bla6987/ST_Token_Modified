@@ -1243,6 +1243,7 @@ window['TokenUsageTracker'] = {
     countTokens, // Expose the token counting function
     getCurrentModelId,
     getCurrentSourceId,
+    flushPendingQuietGeneration,
     // Subscribe to updates
     onUpdate: (callback) => {
         eventSource.on('tokenUsageUpdated', callback);
@@ -3599,6 +3600,23 @@ async function flushQuietGeneration() {
         pendingSourceId = null;
         isQuietGeneration = false;
     }
+}
+
+/**
+ * Flush pending quiet usage immediately, optionally with caller-provided output text.
+ * Returns false when no quiet usage is pending.
+ * @param {string} [outputText]
+ * @returns {Promise<boolean>}
+ */
+async function flushPendingQuietGeneration(outputText = '') {
+    if (!isQuietGeneration || !pendingInputTokensPromise) return false;
+
+    if (typeof outputText === 'string' && outputText.length > 0) {
+        pendingQuietOutput = outputText;
+    }
+
+    await flushQuietGeneration();
+    return true;
 }
 
 function patchConnectionManager() {
