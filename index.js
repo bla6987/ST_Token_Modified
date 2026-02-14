@@ -3509,7 +3509,9 @@ function createSettingsUI() {
         resizeObserver.observe(chartContainer);
     }
 
-    // Fallback: window resize
+    // Fallback: window resize (abort previous listener to prevent duplicates)
+    if (resizeAbortController) resizeAbortController.abort();
+    resizeAbortController = new AbortController();
     let resizeTimeout;
     window.addEventListener('resize', () => {
         clearTimeout(resizeTimeout);
@@ -3518,22 +3520,23 @@ function createSettingsUI() {
             // Also reposition miniview to keep it within bounds
             debouncedMiniviewResize();
         }, 100);
-    });
+    }, { signal: resizeAbortController.signal });
 }
 
 /**
- * Patch SillyTavern's background generation functions to track tokens
- * - generateQuiet / generate_quiet (Used by Summarize, generated prompts, etc.)
- * - ConnectionManagerRequestService.sendRequest (Used by extensions like Roadway)
+ * Set up tracking for background generations:
+ * - Quiet generations (Summarize, Expressions, etc.) via event listeners
+ * - ConnectionManagerRequestService.sendRequest (Roadway, Scratch Pad, etc.) via function wrapping
  */
 let isTrackingBackground = false;
+let resizeAbortController = null;
 
 function patchBackgroundGenerations() {
-    patchGenerateQuietPrompt();
+    registerQuietGenerationListeners();
     patchConnectionManager();
 }
 
-function patchGenerateQuietPrompt() {
+function registerQuietGenerationListeners() {
     // For quiet generations (Guided Generations, Summarize, Expressions, etc.),
     // MESSAGE_RECEIVED doesn't fire. Flush pending tokens on next generation or chat change.
     // IMPORTANT: These handlers must be non-blocking to avoid freezing the UI
@@ -3619,73 +3622,87 @@ async function flushPendingQuietGeneration(outputText = '') {
     return true;
 }
 
-function patchConnectionManager() {
-    // Poll for ConnectionManagerRequestService (used by Roadway and similar extensions)
-    const checkInterval = setInterval(() => {
-        try {
-            const context = getContext();
-            const ServiceClass = context?.ConnectionManagerRequestService;
+/** Unique symbol to mark sendRequest as patched by this extension. */
+const TOKEN_USAGE_PATCHED = Symbol.for('tokenUsageTrackerPatched');
 
-            if (!ServiceClass || typeof ServiceClass.sendRequest !== 'function') return;
-            if (ServiceClass.sendRequest._isPatched) {
-                clearInterval(checkInterval);
-                return;
+function patchConnectionManager() {
+    // Try immediately — Connection Manager may already be loaded
+    if (tryPatchSendRequest()) return;
+
+    // Otherwise wait for APP_READY (fires after all extensions load)
+    const onReady = () => {
+        if (!tryPatchSendRequest()) {
+            console.warn('[Token Usage Tracker] ConnectionManagerRequestService not available — connection profile calls will not be tracked');
+        }
+    };
+
+    if (event_types.APP_READY) {
+        eventSource.on(event_types.APP_READY, onReady);
+    } else {
+        // Fallback for older ST versions without APP_READY
+        setTimeout(onReady, 3000);
+    }
+}
+
+function tryPatchSendRequest() {
+    try {
+        const context = getContext();
+        const ServiceClass = context?.ConnectionManagerRequestService;
+        if (!ServiceClass || typeof ServiceClass.sendRequest !== 'function') return false;
+        if (ServiceClass.sendRequest[TOKEN_USAGE_PATCHED]) return true; // Already patched by us
+
+        const originalSendRequest = ServiceClass.sendRequest.bind(ServiceClass);
+
+        ServiceClass.sendRequest = async function (profileId, messages, maxTokens, custom, overridePayload) {
+            if (isTrackingBackground) {
+                return await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
             }
 
-            const originalSendRequest = ServiceClass.sendRequest.bind(ServiceClass);
+            let inputTokens = 0;
+            // Best-effort: captures the globally-selected model/source at call time.
+            // May not reflect the actual model used if the extension overrides it.
+            const modelId = getCurrentModelId();
+            const sourceId = getCurrentSourceId();
 
-            ServiceClass.sendRequest = async function (profileId, messages, maxTokens, custom, overridePayload) {
-                if (isTrackingBackground) {
-                    return await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
-                }
-
-                let inputTokens = 0;
-                // Best-effort: captures the globally-selected model/source at call time.
-                // May not reflect the actual model used if the extension overrides it.
-                const modelId = getCurrentModelId();
-                const sourceId = getCurrentSourceId();
+            try {
+                isTrackingBackground = true;
 
                 try {
-                    isTrackingBackground = true;
-
-                    try {
-                        inputTokens = await countInputTokens({ prompt: messages });
-                    } catch (e) {
-                        console.error('[Token Usage Tracker] Error counting sendRequest input:', e);
-                    }
-
-                    const result = await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
-
-                    try {
-                        let outputTokens = 0;
-                        if (result && typeof result.content === 'string') {
-                            outputTokens = await countTokens(result.content);
-                        } else if (typeof result === 'string') {
-                            outputTokens = await countTokens(result);
-                        }
-
-                        if (outputTokens > 0 || inputTokens > 0) {
-                            recordUsage(inputTokens, outputTokens, null, modelId, sourceId);
-                        }
-                    } catch (e) {
-                        console.error('[Token Usage Tracker] Error counting sendRequest output:', e);
-                    }
-
-                    return result;
-                } finally {
-                    isTrackingBackground = false;
+                    inputTokens = await countInputTokens({ prompt: messages });
+                } catch (e) {
+                    console.error('[Token Usage Tracker] Error counting sendRequest input:', e);
                 }
-            };
 
-            ServiceClass.sendRequest._isPatched = true;
-            clearInterval(checkInterval);
-        } catch (e) {
-            console.error('[Token Usage Tracker] Error in patchConnectionManager:', e);
-        }
-    }, 1000);
+                const result = await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
 
-    // Stop polling after 30 seconds
-    setTimeout(() => clearInterval(checkInterval), 30000);
+                try {
+                    let outputTokens = 0;
+                    if (result && typeof result.content === 'string') {
+                        outputTokens = await countTokens(result.content);
+                    } else if (typeof result === 'string') {
+                        outputTokens = await countTokens(result);
+                    }
+
+                    if (outputTokens > 0 || inputTokens > 0) {
+                        recordUsage(inputTokens, outputTokens, null, modelId, sourceId);
+                    }
+                } catch (e) {
+                    console.error('[Token Usage Tracker] Error counting sendRequest output:', e);
+                }
+
+                return result;
+            } finally {
+                isTrackingBackground = false;
+            }
+        };
+
+        ServiceClass.sendRequest[TOKEN_USAGE_PATCHED] = true;
+        console.log('[Token Usage Tracker] Patched ConnectionManagerRequestService.sendRequest');
+        return true;
+    } catch (e) {
+        console.error('[Token Usage Tracker] Error in tryPatchSendRequest:', e);
+        return false;
+    }
 }
 
 /**
