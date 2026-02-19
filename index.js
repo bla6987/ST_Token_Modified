@@ -1974,9 +1974,6 @@ function renderChart() {
             cursor.setAttribute('fill', CHART_COLORS.cursor);
             showTooltip(d);
         });
-        cursor.addEventListener('mousemove', (e) => {
-            moveTooltip(e);
-        });
         cursor.addEventListener('mouseleave', () => {
             cursor.setAttribute('fill', 'transparent');
             hideTooltip();
@@ -2069,6 +2066,9 @@ function renderChart() {
             textGroup.appendChild(label);
         }
     });
+
+    // Single delegated mousemove on the cursor group instead of per-element handlers
+    cursorGroup.addEventListener('mousemove', moveTooltip);
 
     container.appendChild(svg);
 }
@@ -2220,9 +2220,6 @@ function renderLineChart() {
             dot.setAttribute('r', String(dotR + 2));
             showTooltip(d);
         });
-        dot.addEventListener('mousemove', (e) => {
-            moveTooltip(e);
-        });
         dot.addEventListener('mouseleave', () => {
             dot.setAttribute('r', String(dotR));
             hideTooltip();
@@ -2244,6 +2241,9 @@ function renderLineChart() {
             textGroup.appendChild(label);
         }
     });
+
+    // Single delegated mousemove on the dot group instead of per-element handlers
+    dotGroup.addEventListener('mousemove', moveTooltip);
 
     container.appendChild(svg);
 }
@@ -2328,33 +2328,48 @@ function showTooltip(d) {
     tooltip.style.display = 'block';
 }
 
+let _tooltipRafPending = false;
+let _tooltipPendingClientX = 0;
+let _tooltipPendingClientY = 0;
+
 function moveTooltip(e) {
     if (!tooltip) return;
 
-    const tooltipWidth = tooltip.offsetWidth || 150;
-    const tooltipHeight = tooltip.offsetHeight || 60;
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
+    _tooltipPendingClientX = e.clientX;
+    _tooltipPendingClientY = e.clientY;
 
-    let x = e.clientX + 15;
-    let y = e.clientY - 10;
+    if (_tooltipRafPending) return;
+    _tooltipRafPending = true;
 
-    // Keep tooltip within viewport
-    if (x + tooltipWidth > viewportWidth - 10) {
-        x = e.clientX - tooltipWidth - 15;
-    }
-    if (y + tooltipHeight > viewportHeight - 10) {
-        y = viewportHeight - tooltipHeight - 10;
-    }
-    if (y < 10) {
-        y = 10;
-    }
-    if (x < 10) {
-        x = 10;
-    }
+    requestAnimationFrame(() => {
+        _tooltipRafPending = false;
+        if (!tooltip || tooltip.style.display === 'none') return;
 
-    tooltip.style.left = x + 'px';
-    tooltip.style.top = y + 'px';
+        const tooltipWidth = tooltip.offsetWidth || 150;
+        const tooltipHeight = tooltip.offsetHeight || 60;
+        const viewportWidth = window.innerWidth;
+        const viewportHeight = window.innerHeight;
+
+        let x = _tooltipPendingClientX + 15;
+        let y = _tooltipPendingClientY - 10;
+
+        // Keep tooltip within viewport
+        if (x + tooltipWidth > viewportWidth - 10) {
+            x = _tooltipPendingClientX - tooltipWidth - 15;
+        }
+        if (y + tooltipHeight > viewportHeight - 10) {
+            y = viewportHeight - tooltipHeight - 10;
+        }
+        if (y < 10) {
+            y = 10;
+        }
+        if (x < 10) {
+            x = 10;
+        }
+
+        tooltip.style.left = x + 'px';
+        tooltip.style.top = y + 'px';
+    });
 }
 
 function hideTooltip() {
@@ -2920,6 +2935,12 @@ function setupMiniviewDrag() {
             startLeft = rect.left;
         }
 
+        // Only add move/up listeners while dragging, so they don't fire on every event globally
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+        document.addEventListener('touchmove', onMouseMove, { passive: true });
+        document.addEventListener('touchend', onMouseUp);
+
         e.preventDefault();
     };
 
@@ -2958,6 +2979,12 @@ function setupMiniviewDrag() {
         isDragging = false;
         header.style.cursor = 'grab';
 
+        // Remove listeners now that drag is done
+        document.removeEventListener('mousemove', onMouseMove);
+        document.removeEventListener('mouseup', onMouseUp);
+        document.removeEventListener('touchmove', onMouseMove);
+        document.removeEventListener('touchend', onMouseUp);
+
         // Save position to settings (convert to bottom/right for backward compatibility)
         const rect = miniviewElement.getBoundingClientRect();
         const settings = getSettings();
@@ -2973,15 +3000,9 @@ function setupMiniviewDrag() {
         saveSettings();
     };
 
-    // Mouse events
+    // Only attach the mousedown/touchstart to the header; move/up listeners are added dynamically
     header.addEventListener('mousedown', onMouseDown);
-    document.addEventListener('mousemove', onMouseMove);
-    document.addEventListener('mouseup', onMouseUp);
-
-    // Touch events for mobile
     header.addEventListener('touchstart', onMouseDown, { passive: false });
-    document.addEventListener('touchmove', onMouseMove, { passive: false });
-    document.addEventListener('touchend', onMouseUp);
 }
 
 /**
@@ -3028,6 +3049,12 @@ function setupMiniviewResize() {
         startWidth = rect.width;
         startHeight = rect.height;
 
+        // Only add move/up listeners while resizing, so they don't fire on every event globally
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+        document.addEventListener('touchmove', onMouseMove, { passive: true });
+        document.addEventListener('touchend', onMouseUp);
+
         e.preventDefault();
         e.stopPropagation();
     };
@@ -3055,6 +3082,12 @@ function setupMiniviewResize() {
 
         isResizing = false;
 
+        // Remove listeners now that resize is done
+        document.removeEventListener('mousemove', onMouseMove);
+        document.removeEventListener('mouseup', onMouseUp);
+        document.removeEventListener('touchmove', onMouseMove);
+        document.removeEventListener('touchend', onMouseUp);
+
         // Save size to settings
         const rect = miniviewElement.getBoundingClientRect();
         const settings = getSettings();
@@ -3069,15 +3102,9 @@ function setupMiniviewResize() {
         saveSettings();
     };
 
-    // Mouse events
+    // Only attach the mousedown/touchstart to the handle; move/up listeners are added dynamically
     handle.addEventListener('mousedown', onMouseDown);
-    document.addEventListener('mousemove', onMouseMove);
-    document.addEventListener('mouseup', onMouseUp);
-
-    // Touch events for mobile
     handle.addEventListener('touchstart', onMouseDown, { passive: false });
-    document.addEventListener('touchmove', onMouseMove, { passive: false });
-    document.addEventListener('touchend', onMouseUp);
 }
 
 /**
@@ -3500,7 +3527,7 @@ function createSettingsUI() {
             for (const entry of entries) {
                 const newWidth = entry.contentRect.width;
                 // Only re-render if width actually changed
-                if (Math.abs(newWidth - lastWidth) > 5) {
+                if (Math.abs(newWidth - lastWidth) > 20) {
                     lastWidth = newWidth;
                     renderChartByType();
                 }
@@ -3513,13 +3540,19 @@ function createSettingsUI() {
     if (resizeAbortController) resizeAbortController.abort();
     resizeAbortController = new AbortController();
     let resizeTimeout;
+    let lastResizeWidth = 0;
     window.addEventListener('resize', () => {
         clearTimeout(resizeTimeout);
         resizeTimeout = setTimeout(() => {
-            renderChartByType();
-            // Also reposition miniview to keep it within bounds
+            // Only re-render if width changed significantly (avoids thrash from mobile keyboard, etc.)
+            const currentWidth = window.innerWidth;
+            if (Math.abs(currentWidth - lastResizeWidth) >= 20) {
+                lastResizeWidth = currentWidth;
+                renderChartByType();
+            }
+            // Always reposition miniview to keep it within bounds
             debouncedMiniviewResize();
-        }, 100);
+        }, 250);
     }, { signal: resizeAbortController.signal });
 }
 

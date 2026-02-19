@@ -51,6 +51,21 @@
   transition: opacity 0.15s ease, transform 0.15s ease;
 }
 
+/* On touch/mobile devices, replace expensive backdrop-filter blur with a solid background
+   and simplify the box-shadow to reduce compositing cost on fixed elements */
+@media (pointer: coarse) {
+  .token-usage-miniview {
+    background: rgba(22, 22, 30, 0.97);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  }
+
+  .token-usage-miniview.pinned {
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  }
+}
+
 .token-usage-miniview.pinned {
   border-color: rgba(99, 102, 241, 0.4);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(99, 102, 241, 0.2) inset;
