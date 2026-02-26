@@ -23,6 +23,12 @@ let externalTimeOffset = null; // Offset between local time and external time (i
 let lastTimeSyncTimestamp = null;
 const TIME_SYNC_INTERVAL = 5 * 60 * 1000; // Re-sync every 5 minutes
 
+// Cached Intl.DateTimeFormat instances (avoid re-creating in hot loops)
+const _fmtDayDisplay = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, month: 'short', day: 'numeric' });
+const _fmtDayFull = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+const _fmtHourDisplay = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, hour: 'numeric', hour12: true });
+const _fmtHourFull = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', hour12: true });
+
 function getEasternParts(date) {
     const dtf = new Intl.DateTimeFormat('en-US', {
         timeZone: EASTERN_TIMEZONE,
@@ -1720,8 +1726,8 @@ function getChartData(days, sourceFilter = 'all') {
             input: input,
             output: output,
             models: models,
-            displayDate: new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, month: 'short', day: 'numeric' }).format(date),
-            fullDate: new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }).format(date)
+            displayDate: _fmtDayDisplay.format(date),
+            fullDate: _fmtDayFull.format(date)
         });
     }
     return data;
@@ -1770,8 +1776,8 @@ function getHourlyChartData(hours, sourceFilter = 'all') {
             input: input,
             output: output,
             models: models,
-            displayDate: new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, hour: 'numeric', hour12: true }).format(date),
-            fullDate: new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', hour12: true }).format(date)
+            displayDate: _fmtHourDisplay.format(date),
+            fullDate: _fmtHourFull.format(date)
         });
     }
     return data;
@@ -2475,6 +2481,13 @@ function updateUIStats() {
     // Today header
     $('#token-usage-mini-counter').text(formatTokens(stats.today.total));
 
+    // If the settings panel is collapsed/hidden, only update miniview and header counter
+    const panelContent = document.querySelector('#token_usage_tracker_container .inline-drawer-content');
+    if (!panelContent || panelContent.offsetParent === null) {
+        updateMiniviewStats(stats);
+        return;
+    }
+
     // Stats grid
     $('#token-usage-week-total').text(formatTokens(stats.thisWeek.total));
     $('#token-usage-month-total').text(formatTokens(stats.thisMonth.total));
@@ -2552,7 +2565,7 @@ function updateUIStats() {
     updateSourceDropdown();
 
     // Update model colors grid
-    renderModelColorsGrid();
+    renderModelColorsGrid(stats);
 
     // Update current chat usage
     updateChatUsageDisplay();
@@ -2561,7 +2574,7 @@ function updateUIStats() {
     updateHealthIndicator();
 
     // Update miniview if visible
-    updateMiniviewStats();
+    updateMiniviewStats(stats);
 }
 
 
@@ -3110,12 +3123,12 @@ function setupMiniviewResize() {
 /**
  * Update miniview stats based on current mode
  */
-function updateMiniviewStats() {
+function updateMiniviewStats(statsParam) {
     if (!miniviewElement) return;
 
     const settings = getSettings();
     const mode = settings.miniview?.mode || 'session';
-    const stats = getUsageStats();
+    const stats = statsParam || getUsageStats();
     const now = getCurrentEasternTime();
 
     let data;
@@ -3186,11 +3199,11 @@ function updateMiniviewStats() {
 /**
  * Render the model colors grid with price inputs
  */
-function renderModelColorsGrid() {
+function renderModelColorsGrid(statsParam) {
     const grid = $('#token-usage-model-colors-grid');
     if (grid.length === 0) return;
 
-    const stats = getUsageStats();
+    const stats = statsParam || getUsageStats();
     const models = Object.keys(stats.byModel || {}).sort();
 
     if (models.length === 0) {
@@ -3541,16 +3554,27 @@ function createSettingsUI() {
     resizeAbortController = new AbortController();
     let resizeTimeout;
     let lastResizeWidth = 0;
+    let lastResizeHeight = 0;
     window.addEventListener('resize', () => {
         clearTimeout(resizeTimeout);
         resizeTimeout = setTimeout(() => {
-            // Only re-render if width changed significantly (avoids thrash from mobile keyboard, etc.)
             const currentWidth = window.innerWidth;
-            if (Math.abs(currentWidth - lastResizeWidth) >= 20) {
+            const currentHeight = window.innerHeight;
+            const widthChanged = Math.abs(currentWidth - lastResizeWidth) >= 20;
+            const heightChanged = Math.abs(currentHeight - lastResizeHeight) >= 20;
+
+            // Skip entirely on keyboard open/close (height-only change)
+            if (!widthChanged && heightChanged) {
+                lastResizeHeight = currentHeight;
+                return;
+            }
+
+            if (widthChanged) {
                 lastResizeWidth = currentWidth;
+                lastResizeHeight = currentHeight;
                 renderChartByType();
             }
-            // Always reposition miniview to keep it within bounds
+            // Only reposition miniview on width changes
             debouncedMiniviewResize();
         }, 250);
     }, { signal: resizeAbortController.signal });
