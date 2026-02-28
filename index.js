@@ -3549,13 +3549,17 @@ function createSettingsUI() {
         resizeObserver.observe(chartContainer);
     }
 
-    // Fallback: window resize (abort previous listener to prevent duplicates)
+    // Bus/fallback resize wiring (prevent duplicate global listeners)
+    if (resizeBusUnsubscribe) {
+        resizeBusUnsubscribe();
+        resizeBusUnsubscribe = null;
+    }
     if (resizeAbortController) resizeAbortController.abort();
     resizeAbortController = new AbortController();
     let resizeTimeout;
     let lastResizeWidth = 0;
     let lastResizeHeight = 0;
-    window.addEventListener('resize', () => {
+    const onViewportResize = () => {
         clearTimeout(resizeTimeout);
         resizeTimeout = setTimeout(() => {
             const currentWidth = window.innerWidth;
@@ -3577,7 +3581,14 @@ function createSettingsUI() {
             // Only reposition miniview on width changes
             debouncedMiniviewResize();
         }, 250);
-    }, { signal: resizeAbortController.signal });
+    };
+
+    const runtimeBus = window.STRuntimeBus;
+    if (runtimeBus?.viewport?.subscribe) {
+        resizeBusUnsubscribe = runtimeBus.viewport.subscribe('layout', onViewportResize);
+    } else {
+        window.addEventListener('resize', onViewportResize, { signal: resizeAbortController.signal });
+    }
 }
 
 /**
@@ -3587,6 +3598,7 @@ function createSettingsUI() {
  */
 let isTrackingBackground = false;
 let resizeAbortController = null;
+let resizeBusUnsubscribe = null;
 
 function patchBackgroundGenerations() {
     registerQuietGenerationListeners();
