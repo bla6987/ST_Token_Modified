@@ -372,6 +372,8 @@ async function fetchOpenRouterPricing() {
 
         settings.openRouterPrices.data = pricingData;
         settings.openRouterPrices.lastFetched = Date.now();
+        invalidateModelPriceCache();
+        modelConfigState.needsRefresh = true;
         saveSettings();
 
         console.log(`[Token Usage Tracker] Cached pricing for ${Object.keys(pricingData).length} OpenRouter models`);
@@ -396,6 +398,14 @@ async function fetchOpenRouterPricing() {
 function escapeHtml(str) {
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;')
         .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+function invalidateModelPriceCache(modelId = null) {
+    if (modelId) {
+        modelPriceCache.delete(modelId);
+        return;
+    }
+    modelPriceCache.clear();
 }
 
 async function maybeAutoFetchOpenRouterPricing() {
@@ -1370,26 +1380,40 @@ function setModelColor(modelId, color) {
  * @returns {{in: number, out: number}} Price per 1M tokens
  */
 function getModelPrice(modelId) {
+    const cacheKey = String(modelId || '');
+    const cached = modelPriceCache.get(cacheKey);
+    if (cached) {
+        return cached;
+    }
+
     const settings = getSettings();
 
     // User-defined prices take priority
-    if (settings.modelPrices[modelId]) {
-        return settings.modelPrices[modelId];
+    if (settings.modelPrices[cacheKey]) {
+        const userPrice = settings.modelPrices[cacheKey];
+        const resolved = {
+            in: parseFloat(userPrice?.in) || 0,
+            out: parseFloat(userPrice?.out) || 0
+        };
+        modelPriceCache.set(cacheKey, resolved);
+        return resolved;
     }
 
     // Auto-populated from OpenRouter cache - try exact match first
-    const orPrice = settings.openRouterPrices?.data?.[modelId];
+    const orPrice = settings.openRouterPrices?.data?.[cacheKey];
     if (orPrice) {
         // OpenRouter returns price per token, convert to per 1M tokens
-        return {
+        const resolved = {
             in: (parseFloat(orPrice.prompt) || 0) * 1000000,
             out: (parseFloat(orPrice.completion) || 0) * 1000000
         };
+        modelPriceCache.set(cacheKey, resolved);
+        return resolved;
     }
 
     // Fallback: Check if the end of modelId matches any key in OpenRouter price data (case-insensitive)
     if (settings.openRouterPrices?.data) {
-        const modelIdLower = modelId.toLowerCase();
+        const modelIdLower = cacheKey.toLowerCase();
 
         // Find the longest matching suffix to prefer more specific matches
         let bestMatch = null;
@@ -1407,15 +1431,19 @@ function getModelPrice(modelId) {
 
         if (bestMatch) {
             const matchedPrice = settings.openRouterPrices.data[bestMatch];
-            console.log(`[Token Usage Tracker] Model "${modelId}" matched to OpenRouter pricing for "${bestMatch}" via suffix match`);
-            return {
+            console.log(`[Token Usage Tracker] Model "${cacheKey}" matched to OpenRouter pricing for "${bestMatch}" via suffix match`);
+            const resolved = {
                 in: (parseFloat(matchedPrice.prompt) || 0) * 1000000,
                 out: (parseFloat(matchedPrice.completion) || 0) * 1000000
             };
+            modelPriceCache.set(cacheKey, resolved);
+            return resolved;
         }
     }
 
-    return { in: 0, out: 0 };
+    const resolved = { in: 0, out: 0 };
+    modelPriceCache.set(cacheKey, resolved);
+    return resolved;
 }
 
 /**
@@ -1430,6 +1458,8 @@ function setModelPrice(modelId, priceIn, priceOut) {
         in: parseFloat(priceIn) || 0,
         out: parseFloat(priceOut) || 0
     };
+    invalidateModelPriceCache(modelId);
+    modelConfigState.needsRefresh = true;
     saveSettings();
 }
 
@@ -1578,6 +1608,8 @@ function importUsageData(jsonString) {
     // Replace model prices (overwrite existing)
     if (data.modelPrices) {
         Object.assign(settings.modelPrices, data.modelPrices);
+        invalidateModelPriceCache();
+        modelConfigState.needsRefresh = true;
     }
 
     // Replace model colors (overwrite existing)
@@ -1601,6 +1633,31 @@ let currentChartType = 'bar'; // 'bar' or 'line'
 let currentGranularity = 'daily'; // 'daily' or 'hourly'
 let chartData = [];
 let tooltip = null;
+
+const MODEL_CONFIG_PAGE_SIZE = 50;
+const MODEL_CONFIG_PRICE_DEBOUNCE_MS = 500;
+const MODEL_CONFIG_SEARCH_DEBOUNCE_MS = 120;
+
+const modelConfigState = {
+    query: '',
+    page: 1,
+    pageSize: MODEL_CONFIG_PAGE_SIZE,
+    isOpen: false,
+    needsRefresh: true,
+    lastModelCount: -1,
+    lastRenderedSignature: '',
+    lastRenderedPage: 1,
+    lastRenderedQuery: '',
+};
+
+const modelPriceCache = new Map();
+const modelConfigPriceTimers = new Map();
+const modelConfigPriceDrafts = new Map();
+let modelConfigSearchTimer = null;
+let modelConfigRenderRaf = null;
+let modelConfigPendingStats = null;
+let modelConfigPendingForce = false;
+let modelConfigVisibilityObserver = null;
 
 // Miniview state
 let miniviewElement = null;
@@ -2482,8 +2539,9 @@ function updateUIStats() {
     $('#token-usage-mini-counter').text(formatTokens(stats.today.total));
 
     // If the settings panel is collapsed/hidden, only update miniview and header counter
-    const panelContent = document.querySelector('#token_usage_tracker_container .inline-drawer-content');
+    const panelContent = document.querySelector('#token-usage-main-content');
     if (!panelContent || panelContent.offsetParent === null) {
+        modelConfigState.needsRefresh = true;
         updateMiniviewStats(stats);
         return;
     }
@@ -2564,8 +2622,21 @@ function updateUIStats() {
     // Update source dropdown options (in case new sources were added)
     updateSourceDropdown();
 
-    // Update model colors grid
-    renderModelColorsGrid(stats);
+    // Update model config state and lazily render when the config drawer is visible
+    const modelCount = Object.keys(stats.byModel || {}).length;
+    if (modelCount !== modelConfigState.lastModelCount) {
+        modelConfigState.needsRefresh = true;
+    }
+
+    const wasConfigOpen = modelConfigState.isOpen;
+    modelConfigState.isOpen = isModelConfigVisible();
+    if (modelConfigState.isOpen) {
+        if (!wasConfigOpen || modelConfigState.needsRefresh) {
+            scheduleModelConfigRender(stats, !wasConfigOpen);
+        }
+    } else {
+        modelConfigState.needsRefresh = true;
+    }
 
     // Update current chat usage
     updateChatUsageDisplay();
@@ -3196,71 +3267,263 @@ function updateMiniviewStats(statsParam) {
 }
 
 
+function isModelConfigVisible() {
+    const configContent = document.getElementById('token-usage-config-content');
+    return Boolean(configContent && configContent.offsetParent !== null);
+}
+
+function updateModelConfigControls(totalModels, filteredCount, startIndex, endIndex, totalPages) {
+    const summary = $('#token-usage-model-summary');
+    const pageLabel = $('#token-usage-model-page-label');
+    const prevBtn = $('#token-usage-model-prev');
+    const nextBtn = $('#token-usage-model-next');
+
+    if (!summary.length || !pageLabel.length || !prevBtn.length || !nextBtn.length) return;
+
+    if (totalModels === 0) {
+        summary.text('No models tracked yet');
+        pageLabel.text('0 / 0');
+        prevBtn.prop('disabled', true);
+        nextBtn.prop('disabled', true);
+        return;
+    }
+
+    if (filteredCount === 0) {
+        summary.text(`No models match "${modelConfigState.query}"`);
+        pageLabel.text('0 / 0');
+        prevBtn.prop('disabled', true);
+        nextBtn.prop('disabled', true);
+        return;
+    }
+
+    if (filteredCount !== totalModels) {
+        summary.text(`Showing ${startIndex}-${endIndex} of ${filteredCount} matches (${totalModels} total)`);
+    } else {
+        summary.text(`Showing ${startIndex}-${endIndex} of ${totalModels} models`);
+    }
+
+    pageLabel.text(`${modelConfigState.page} / ${totalPages}`);
+    prevBtn.prop('disabled', modelConfigState.page <= 1);
+    nextBtn.prop('disabled', modelConfigState.page >= totalPages);
+}
+
+function scheduleModelConfigRender(statsParam = null, force = false) {
+    if (statsParam) {
+        modelConfigPendingStats = statsParam;
+    }
+    modelConfigPendingForce = modelConfigPendingForce || force;
+
+    if (modelConfigRenderRaf !== null) return;
+
+    const runRender = () => {
+        modelConfigRenderRaf = null;
+        const statsForRender = modelConfigPendingStats;
+        const forceRender = modelConfigPendingForce;
+        modelConfigPendingStats = null;
+        modelConfigPendingForce = false;
+        renderModelColorsGrid(statsForRender, { force: forceRender });
+    };
+
+    if (typeof requestAnimationFrame === 'function') {
+        modelConfigRenderRaf = requestAnimationFrame(runRender);
+    } else {
+        modelConfigRenderRaf = setTimeout(runRender, 0);
+    }
+}
+
+function syncModelConfigVisibility(forceRender = false) {
+    const wasOpen = modelConfigState.isOpen;
+    const isOpen = isModelConfigVisible();
+    modelConfigState.isOpen = isOpen;
+
+    if (!isOpen) return;
+
+    if (forceRender || !wasOpen || modelConfigState.needsRefresh) {
+        scheduleModelConfigRender(null, true);
+    }
+}
+
+function bindModelConfigControls() {
+    const searchInput = $('#token-usage-model-search');
+    const prevBtn = $('#token-usage-model-prev');
+    const nextBtn = $('#token-usage-model-next');
+    const grid = $('#token-usage-model-colors-grid');
+
+    searchInput.off('.tokenUsageConfig');
+    prevBtn.off('.tokenUsageConfig');
+    nextBtn.off('.tokenUsageConfig');
+    grid.off('.tokenUsageConfig');
+
+    searchInput.on('input.tokenUsageConfig', function () {
+        const rawQuery = String($(this).val() || '');
+        clearTimeout(modelConfigSearchTimer);
+        modelConfigSearchTimer = setTimeout(() => {
+            const normalizedQuery = rawQuery.trim().toLowerCase();
+            if (normalizedQuery === modelConfigState.query) return;
+            modelConfigState.query = normalizedQuery;
+            modelConfigState.page = 1;
+            modelConfigState.needsRefresh = true;
+            scheduleModelConfigRender(null, true);
+        }, MODEL_CONFIG_SEARCH_DEBOUNCE_MS);
+    });
+
+    prevBtn.on('click.tokenUsageConfig', () => {
+        if (modelConfigState.page <= 1) return;
+        modelConfigState.page -= 1;
+        modelConfigState.needsRefresh = true;
+        scheduleModelConfigRender(null, true);
+    });
+
+    nextBtn.on('click.tokenUsageConfig', () => {
+        modelConfigState.page += 1;
+        modelConfigState.needsRefresh = true;
+        scheduleModelConfigRender(null, true);
+    });
+
+    grid.on('change.tokenUsageConfig', '.model-color-picker', function () {
+        const modelId = String($(this).data('model') || '');
+        if (!modelId) return;
+        setModelColor(modelId, String($(this).val() || ''));
+        renderChartByType();
+    });
+
+    grid.on('input.tokenUsageConfig', '.price-input-in, .price-input-out', function () {
+        const modelId = String($(this).data('model') || '');
+        if (!modelId) return;
+
+        const row = $(this).closest('.model-config-row');
+        modelConfigPriceDrafts.set(modelId, {
+            in: String(row.find('.price-input-in').val() ?? ''),
+            out: String(row.find('.price-input-out').val() ?? ''),
+        });
+
+        const existingTimer = modelConfigPriceTimers.get(modelId);
+        if (existingTimer) {
+            clearTimeout(existingTimer);
+        }
+
+        const timer = setTimeout(() => {
+            const draft = modelConfigPriceDrafts.get(modelId);
+            modelConfigPriceTimers.delete(modelId);
+            if (!draft) return;
+            modelConfigPriceDrafts.delete(modelId);
+            setModelPrice(modelId, draft.in, draft.out);
+            updateUIStats();
+        }, MODEL_CONFIG_PRICE_DEBOUNCE_MS);
+
+        modelConfigPriceTimers.set(modelId, timer);
+    });
+}
+
+function observeModelConfigVisibility() {
+    if (typeof MutationObserver === 'undefined') return;
+
+    const mainContent = document.getElementById('token-usage-main-content');
+    const configContent = document.getElementById('token-usage-config-content');
+    if (!mainContent || !configContent) return;
+
+    if (modelConfigVisibilityObserver) {
+        modelConfigVisibilityObserver.disconnect();
+    }
+
+    modelConfigVisibilityObserver = new MutationObserver(() => {
+        syncModelConfigVisibility();
+    });
+
+    const options = { attributes: true, attributeFilter: ['class', 'style'] };
+    modelConfigVisibilityObserver.observe(mainContent, options);
+    modelConfigVisibilityObserver.observe(configContent, options);
+}
+
 /**
- * Render the model colors grid with price inputs
+ * Render the model colors grid with search + pagination
  */
-function renderModelColorsGrid(statsParam) {
+function renderModelColorsGrid(statsParam, options = {}) {
     const grid = $('#token-usage-model-colors-grid');
     if (grid.length === 0) return;
 
+    const force = Boolean(options.force);
+    if (!isModelConfigVisible() && !force) {
+        modelConfigState.needsRefresh = true;
+        return;
+    }
+
     const stats = statsParam || getUsageStats();
     const models = Object.keys(stats.byModel || {}).sort();
+    const signature = models.join('\u0001');
+
+    modelConfigState.lastModelCount = models.length;
+
+    const query = modelConfigState.query;
+    const filtered = query
+        ? models.filter(model => model.toLowerCase().includes(query))
+        : models;
+
+    const totalPages = Math.max(1, Math.ceil(filtered.length / modelConfigState.pageSize));
+    modelConfigState.page = Math.min(Math.max(modelConfigState.page, 1), totalPages);
+
+    const shouldSkipRender = !force
+        && !modelConfigState.needsRefresh
+        && modelConfigState.lastRenderedSignature === signature
+        && modelConfigState.lastRenderedPage === modelConfigState.page
+        && modelConfigState.lastRenderedQuery === modelConfigState.query;
+
+    if (shouldSkipRender) {
+        return;
+    }
 
     if (models.length === 0) {
         grid.empty().append('<div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.5; padding: 8px; text-align: center;">No models tracked yet</div>');
+        updateModelConfigControls(0, 0, 0, 0, 0);
+        modelConfigState.lastRenderedSignature = signature;
+        modelConfigState.lastRenderedPage = 1;
+        modelConfigState.lastRenderedQuery = modelConfigState.query;
+        modelConfigState.needsRefresh = false;
         return;
     }
 
-    // If grid is already populated with the same models, don't wipe it (prevents input focus loss)
-    const existingRows = grid.children('.model-config-row');
-    if (existingRows.length === models.length) {
-        // Assume same order check isn't needed for now, unlikely to change order rapidly
+    if (filtered.length === 0) {
+        grid.empty().append('<div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.5; padding: 8px; text-align: center;">No matching models</div>');
+        updateModelConfigControls(models.length, 0, 0, 0, 0);
+        modelConfigState.lastRenderedSignature = signature;
+        modelConfigState.lastRenderedPage = 1;
+        modelConfigState.lastRenderedQuery = modelConfigState.query;
+        modelConfigState.needsRefresh = false;
         return;
     }
 
-    grid.empty();
+    const startIndex = (modelConfigState.page - 1) * modelConfigState.pageSize;
+    const endIndex = Math.min(startIndex + modelConfigState.pageSize, filtered.length);
+    const pageModels = filtered.slice(startIndex, endIndex);
 
-    for (const model of models) {
+    let rowsHtml = '';
+    for (const model of pageModels) {
         const color = getModelColor(model);
         const prices = getModelPrice(model);
-
+        const priceIn = prices.in > 0 ? String(prices.in) : '';
+        const priceOut = prices.out > 0 ? String(prices.out) : '';
         const safeModel = escapeHtml(model);
-        const row = $(`
+
+        rowsHtml += `
             <div class="model-config-row" style="display: flex; align-items: center; gap: 4px; min-width: 0;">
                 <input type="color" value="${color}" data-model="${safeModel}"
                        class="model-color-picker"
                        style="width: 20px; height: 20px; padding: 0; border: none; cursor: pointer; flex-shrink: 0; border-radius: 4px;">
                 <span title="${safeModel}" style="font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--SmartThemeBodyColor); flex: 1;">${safeModel}</span>
                 <span style="font-size: 8px; color: var(--SmartThemeBodyColor); opacity: 0.5; flex-shrink: 0;">Price</span>
-                <input type="number" class="price-input-in" data-model="${safeModel}" value="${prices.in || ''}" step="0.01" min="0" placeholder="In" title="Price per 1M input tokens" style="width: 28px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
-                <input type="number" class="price-input-out" data-model="${safeModel}" value="${prices.out || ''}" step="0.01" min="0" placeholder="Out" title="Price per 1M output tokens" style="width: 28px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
+                <input type="number" class="price-input-in" data-model="${safeModel}" value="${priceIn}" step="0.01" min="0" placeholder="In" title="Price per 1M input tokens" style="width: 40px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
+                <input type="number" class="price-input-out" data-model="${safeModel}" value="${priceOut}" step="0.01" min="0" placeholder="Out" title="Price per 1M output tokens" style="width: 40px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
             </div>
-        `);
-
-        // Color picker handler
-        row.find('.model-color-picker').on('change', function () {
-            setModelColor(String($(this).data('model')), String($(this).val()));
-            renderChartByType();
-        });
-
-        // Price input handlers with debounce
-        let debounceTimer;
-        const handlePriceChange = () => {
-            const mId = model; // closure
-            const pIn = row.find('.price-input-in').val();
-            const pOut = row.find('.price-input-out').val();
-            setModelPrice(mId, pIn, pOut);
-            // Trigger UI update to recalc costs
-            updateUIStats();
-        };
-
-        row.find('input[type="number"]').on('input', function () {
-            clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(handlePriceChange, 500);
-        });
-
-        grid.append(row);
+        `;
     }
+
+    grid.html(rowsHtml);
+    updateModelConfigControls(models.length, filtered.length, startIndex + 1, endIndex, totalPages);
+
+    modelConfigState.lastRenderedSignature = signature;
+    modelConfigState.lastRenderedPage = modelConfigState.page;
+    modelConfigState.lastRenderedQuery = modelConfigState.query;
+    modelConfigState.needsRefresh = false;
 }
 
 /**
@@ -3273,14 +3536,14 @@ function createSettingsUI() {
     const html = `
         <div id="token_usage_tracker_container" class="extension_container">
             <div class="inline-drawer">
-                <div class="inline-drawer-toggle inline-drawer-header">
+                <div id="token-usage-main-toggle" class="inline-drawer-toggle inline-drawer-header">
                     <b>Token Usage Tracker</b>
                     <span id="token-usage-mini-counter" style="margin-left: 8px; font-size: 11px; color: var(--SmartThemeBodyColor); opacity: 0.75;" title="Today's total tokens">${formatTokens(stats.today.total)}</span>
                     <span id="token-usage-health-indicator" style="margin-left: 6px; font-size: 10px; cursor: help;" title="Extension health status">🟢</span>
                     <button id="token-usage-miniview-toggle" class="menu_button" style="margin-left: 6px; padding: 2px 6px; font-size: 10px;" title="Toggle compact miniview">📊</button>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
-                <div class="inline-drawer-content">
+                <div id="token-usage-main-content" class="inline-drawer-content">
                     <!-- Chart Header: Today stats + Range/Source selectors -->
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                         <div>
@@ -3424,11 +3687,20 @@ function createSettingsUI() {
 
                     <!-- Config (Model Colors & Prices) -->
                     <div class="inline-drawer" style="margin-top: 10px;">
-                        <div class="inline-drawer-toggle inline-drawer-header" style="padding: 4px 0 4px 8px;">
+                        <div id="token-usage-config-toggle" class="inline-drawer-toggle inline-drawer-header" style="padding: 4px 0 4px 8px;">
                             <span style="font-size: 11px;">Config</span>
                             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                         </div>
-                        <div class="inline-drawer-content">
+                        <div id="token-usage-config-content" class="inline-drawer-content">
+                            <div id="token-usage-model-config-controls" style="display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px;">
+                                <input id="token-usage-model-search" type="text" placeholder="Search models..." style="flex: 1; min-width: 140px; padding: 3px 6px; font-size: 10px; border-radius: 4px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor);">
+                                <div style="display: inline-flex; align-items: center; gap: 4px;">
+                                    <button id="token-usage-model-prev" class="menu_button" style="padding: 2px 6px; font-size: 10px;">Prev</button>
+                                    <span id="token-usage-model-page-label" style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.7; min-width: 42px; text-align: center;">0 / 0</span>
+                                    <button id="token-usage-model-next" class="menu_button" style="padding: 2px 6px; font-size: 10px;">Next</button>
+                                </div>
+                            </div>
+                            <div id="token-usage-model-summary" style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.55; margin-bottom: 6px;">No models tracked yet</div>
                             <div id="token-usage-model-colors-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px;"></div>
                         </div>
                     </div>
@@ -3474,6 +3746,19 @@ function createSettingsUI() {
 
     // Initialize source dropdown
     updateSourceDropdown();
+
+    // Initialize model config controls and lazy rendering
+    $('#token-usage-model-search').val(modelConfigState.query);
+    updateModelConfigControls(0, 0, 0, 0, 0);
+    bindModelConfigControls();
+    observeModelConfigVisibility();
+
+    const syncConfigAfterToggle = () => {
+        setTimeout(() => syncModelConfigVisibility(true), 0);
+    };
+    $('#token-usage-main-toggle').on('click', syncConfigAfterToggle);
+    $('#token-usage-config-toggle').on('click', syncConfigAfterToggle);
+    syncModelConfigVisibility(true);
 
     // Range button handlers
     document.querySelectorAll('.token-usage-range-btn').forEach(btn => {
