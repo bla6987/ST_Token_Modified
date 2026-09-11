@@ -17,12 +17,15 @@
 
 /* Hide number input spin buttons */
 #token-usage-model-colors-grid input[type="number"]::-webkit-outer-spin-button,
-#token-usage-model-colors-grid input[type="number"]::-webkit-inner-spin-button {
+#token-usage-model-colors-grid input[type="number"]::-webkit-inner-spin-button,
+.token-usage-bulk-price input[type="number"]::-webkit-outer-spin-button,
+.token-usage-bulk-price input[type="number"]::-webkit-inner-spin-button {
   -webkit-appearance: none;
   margin: 0;
 }
 
-#token-usage-model-colors-grid input[type="number"] {
+#token-usage-model-colors-grid input[type="number"],
+.token-usage-bulk-price input[type="number"] {
   -moz-appearance: textfield;
   appearance: textfield;
 }
@@ -30,6 +33,65 @@
 /* Compact model config row */
 .model-config-row {
   padding: 2px 0;
+}
+
+/* One deliberate bulk action for the complete filtered model set. */
+.token-usage-bulk-price {
+  display: grid;
+  grid-template-columns: auto minmax(52px, 0.6fr) minmax(52px, 0.6fr) minmax(112px, auto);
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 5px;
+  padding: 5px 6px;
+  border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor) 72%, transparent);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--SmartThemeInputColor) 82%, transparent);
+}
+
+.token-usage-bulk-price label {
+  color: var(--SmartThemeBodyColor);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.token-usage-bulk-price label span {
+  opacity: 0.55;
+  font-weight: 500;
+}
+
+.token-usage-bulk-price input {
+  min-width: 0;
+  padding: 3px 5px;
+  border: 1px solid var(--SmartThemeBorderColor);
+  border-radius: 3px;
+  background: var(--SmartThemeInputColor);
+  color: var(--SmartThemeBodyColor);
+  font-size: 9px;
+}
+
+.token-usage-bulk-price button {
+  min-width: 112px;
+  padding: 3px 7px;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.token-usage-bulk-price button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+@media (max-width: 700px) {
+  .token-usage-bulk-price {
+    grid-template-columns: auto minmax(52px, 1fr) minmax(52px, 1fr);
+  }
+
+  .token-usage-bulk-price button {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
 }
 
 /* ===== Compact Miniview Styles ===== */

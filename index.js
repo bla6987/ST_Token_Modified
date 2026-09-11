@@ -1453,12 +1453,28 @@ function getModelPrice(modelId) {
  * @param {number} priceOut - Price per 1M output tokens
  */
 function setModelPrice(modelId, priceIn, priceOut) {
+    setModelPrices([modelId], priceIn, priceOut);
+}
+
+/**
+ * Set the same price for multiple models and persist once.
+ * @param {string[]} modelIds
+ * @param {number} priceIn - Price per 1M input tokens
+ * @param {number} priceOut - Price per 1M output tokens
+ */
+function setModelPrices(modelIds, priceIn, priceOut) {
     const settings = getSettings();
-    settings.modelPrices[modelId] = {
+    const price = {
         in: parseFloat(priceIn) || 0,
         out: parseFloat(priceOut) || 0
     };
-    invalidateModelPriceCache(modelId);
+
+    for (const modelId of new Set(modelIds)) {
+        if (!modelId) continue;
+        settings.modelPrices[modelId] = { ...price };
+    }
+
+    invalidateModelPriceCache();
     modelConfigState.needsRefresh = true;
     saveSettings();
 }
@@ -3277,8 +3293,16 @@ function updateModelConfigControls(totalModels, filteredCount, startIndex, endIn
     const pageLabel = $('#token-usage-model-page-label');
     const prevBtn = $('#token-usage-model-prev');
     const nextBtn = $('#token-usage-model-next');
+    const bulkApplyBtn = $('#token-usage-bulk-apply');
 
     if (!summary.length || !pageLabel.length || !prevBtn.length || !nextBtn.length) return;
+
+    if (bulkApplyBtn.length) {
+        const buttonLabel = modelConfigState.query
+            ? `Apply to ${filteredCount} match${filteredCount === 1 ? '' : 'es'}`
+            : `Apply to all ${filteredCount}`;
+        bulkApplyBtn.text(buttonLabel).prop('disabled', filteredCount === 0);
+    }
 
     if (totalModels === 0) {
         summary.text('No models tracked yet');
@@ -3347,11 +3371,13 @@ function bindModelConfigControls() {
     const searchInput = $('#token-usage-model-search');
     const prevBtn = $('#token-usage-model-prev');
     const nextBtn = $('#token-usage-model-next');
+    const bulkApplyBtn = $('#token-usage-bulk-apply');
     const grid = $('#token-usage-model-colors-grid');
 
     searchInput.off('.tokenUsageConfig');
     prevBtn.off('.tokenUsageConfig');
     nextBtn.off('.tokenUsageConfig');
+    bulkApplyBtn.off('.tokenUsageConfig');
     grid.off('.tokenUsageConfig');
 
     searchInput.on('input.tokenUsageConfig', function () {
@@ -3378,6 +3404,54 @@ function bindModelConfigControls() {
         modelConfigState.page += 1;
         modelConfigState.needsRefresh = true;
         scheduleModelConfigRender(null, true);
+    });
+
+    bulkApplyBtn.on('click.tokenUsageConfig', () => {
+        // Use the live search value so a click immediately after typing cannot
+        // apply to the previous debounced filter.
+        clearTimeout(modelConfigSearchTimer);
+        const query = String(searchInput.val() || '').trim().toLowerCase();
+        if (query !== modelConfigState.query) {
+            modelConfigState.query = query;
+            modelConfigState.page = 1;
+        }
+
+        const stats = getUsageStats();
+        const models = Object.keys(stats.byModel || {}).sort();
+        const filteredModels = query
+            ? models.filter(model => model.toLowerCase().includes(query))
+            : models;
+
+        if (filteredModels.length === 0) {
+            toastr.warning('No models match the current search');
+            scheduleModelConfigRender(stats, true);
+            return;
+        }
+
+        const rawPriceIn = String($('#token-usage-bulk-price-in').val() ?? '').trim();
+        const rawPriceOut = String($('#token-usage-bulk-price-out').val() ?? '').trim();
+        const priceIn = Number(rawPriceIn);
+        const priceOut = Number(rawPriceOut);
+
+        if (rawPriceIn === '' || rawPriceOut === ''
+            || !Number.isFinite(priceIn) || !Number.isFinite(priceOut)
+            || priceIn < 0 || priceOut < 0) {
+            toastr.warning('Enter valid non-negative input and output prices');
+            return;
+        }
+
+        // A pending single-row edit should not overwrite the bulk operation.
+        for (const modelId of filteredModels) {
+            const pendingTimer = modelConfigPriceTimers.get(modelId);
+            if (pendingTimer) clearTimeout(pendingTimer);
+            modelConfigPriceTimers.delete(modelId);
+            modelConfigPriceDrafts.delete(modelId);
+        }
+
+        setModelPrices(filteredModels, priceIn, priceOut);
+        updateUIStats();
+        scheduleModelConfigRender(stats, true);
+        toastr.success(`Updated pricing for ${filteredModels.length} model${filteredModels.length === 1 ? '' : 's'}`);
     });
 
     grid.on('change.tokenUsageConfig', '.model-color-picker', function () {
@@ -3699,6 +3773,12 @@ function createSettingsUI() {
                                     <span id="token-usage-model-page-label" style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.7; min-width: 42px; text-align: center;">0 / 0</span>
                                     <button id="token-usage-model-next" class="menu_button" style="padding: 2px 6px; font-size: 10px;">Next</button>
                                 </div>
+                            </div>
+                            <div class="token-usage-bulk-price" title="Set the same price for every model matched by the search, including models on other pages">
+                                <label for="token-usage-bulk-price-in">Bulk <span>$/1M</span></label>
+                                <input id="token-usage-bulk-price-in" type="number" min="0" step="0.01" placeholder="Input" aria-label="Bulk input price per 1 million tokens">
+                                <input id="token-usage-bulk-price-out" type="number" min="0" step="0.01" placeholder="Output" aria-label="Bulk output price per 1 million tokens">
+                                <button id="token-usage-bulk-apply" class="menu_button" type="button" disabled>Apply to all 0</button>
                             </div>
                             <div id="token-usage-model-summary" style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.55; margin-bottom: 6px;">No models tracked yet</div>
                             <div id="token-usage-model-colors-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px;"></div>

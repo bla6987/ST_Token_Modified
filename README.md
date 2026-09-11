@@ -31,6 +31,7 @@ A SillyTavern extension that tracks and visualizes token usage and price for you
 - **Reasoning/thinking token tracking** with 🧠 indicator
 - Per-chat usage statistics via `/tokenchat` command
 - Cost calculation based on model pricing
+- Bulk pricing for every model matched by the config search, including provider-prefixed variants and results on other pages
 
 ### Charts & Visualization
 - Daily and hourly usage charts
