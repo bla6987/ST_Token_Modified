@@ -31,7 +31,7 @@ A SillyTavern extension that tracks and visualizes token usage and price for you
 - **Reasoning/thinking token tracking** with 🧠 indicator
 - Per-chat usage statistics via `/tokenchat` command
 - Cost calculation based on model pricing
-- Bulk pricing for every model matched by the config search, including provider-prefixed variants and results on other pages
+- Shared model pricing with expandable provider variants, individual overrides, and automatic inheritance for future matching variants
 
 ### Charts & Visualization
 - Daily and hourly usage charts
@@ -53,6 +53,24 @@ Once installed, the extension will automatically start tracking token usage. The
 
 - Use `/tokenmini` to toggle the compact miniview
 - Use `/tokenchat` to view current chat statistics
+
+### Shared model pricing
+
+Open **Token Usage Tracker → Config**, search for a model, enter input/output prices in **$/1M tokens**, and click **Save shared**. Every linked variant uses this price unless it has an individual override. Future matching variants inherit it too.
+
+- Expand a model to see each variant, its effective price, and whether it uses shared pricing, an override, or automatic pricing.
+- **Save override** sets a different price for one variant. **Use shared** removes that override.
+- **Link to** moves an unusually named alias into another pricing group. Existing overrides follow the variant; use **Use shared** to adopt the destination group's rate.
+- **Separate** takes a variant out of the suggested group while preserving its configured effective price.
+- **Use automatic pricing** removes a group's shared rate and falls back to the existing OpenRouter pricing cache for variants without overrides.
+
+Suggested groups match exact versioned model names after simple provider/organization prefixes (for example, `anthropic/claude-3.7-sonnet` and `proxy/anthropic/claude-3.7-sonnet`). Dates, versions, quantization markers, `:free`, and `thinking` suffixes remain distinct. Unrecognized names stay separate until manually linked.
+
+Existing prices are preserved on upgrade. The first time a shared price is saved, identical existing prices become inherited prices; different prices remain overrides. Later shared-price edits preserve all overrides. Search filters whole groups and never limits the scope of a shared-price edit. Costs, including historical estimates, use the currently configured rates as before. Usage records and model identities are unchanged.
+
+`/tokenexport` and `/tokenimport` include shared prices and manual links. New-format backups restore the complete pricing configuration; older backups continue to merge exact-model prices.
+
+Run the pricing regression tests with `node --test tests/pricing.test.mjs` (Node 22.7+).
 
 ## Credits
 

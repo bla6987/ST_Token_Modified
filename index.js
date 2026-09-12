@@ -15,6 +15,7 @@ import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.j
 import { SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
 import { getChatCompletionModel, oai_settings } from '../../../openai.js';
 import { textgenerationwebui_settings as textgen_settings } from '../../../textgen-settings.js';
+import { parsePrice, configuredPrice, collectPriceGroups, saveSharedPrice, readPricingSnapshot } from './pricing.js';
 
 const extensionName = 'token-usage-tracker';
 
@@ -122,6 +123,8 @@ const defaultSettings = {
     modelColors: {}, // { "gpt-4o": "#6366f1", "claude-3-opus": "#8b5cf6", ... }
     // Prices per 1M tokens: { "gpt-4o": { in: 2.5, out: 10 }, ... }
     modelPrices: {},
+    sharedModelPrices: {}, // Group ID -> shared input/output prices per 1M tokens
+    modelPriceGroups: {}, // Explicit model ID -> group ID links (including separate models)
     // OpenRouter auto-fetched pricing cache
     openRouterPrices: {
         data: {},         // { "model-id": { prompt: X, completion: Y } } - per-token pricing
@@ -176,6 +179,8 @@ function loadSettings() {
 
     // Initialize modelPrices
     if (!settings.modelPrices) settings.modelPrices = {};
+    if (!settings.sharedModelPrices) settings.sharedModelPrices = {};
+    if (!settings.modelPriceGroups) settings.modelPriceGroups = {};
 
     // Migration: Convert byDay.models from numeric format to object format
     // Old: models[modelId] = totalTokens (number)
@@ -1375,7 +1380,7 @@ function setModelColor(modelId, color) {
 
 /**
  * Get price settings for a model
- * Priority: 1) User-defined price, 2) OpenRouter cache (exact), 3) OpenRouter cache (suffix match), 4) Default zeros
+ * Priority: model override, shared group, OpenRouter exact/suffix, default zeros.
  * @param {string} modelId
  * @returns {{in: number, out: number}} Price per 1M tokens
  */
@@ -1388,9 +1393,9 @@ function getModelPrice(modelId) {
 
     const settings = getSettings();
 
-    // User-defined prices take priority
-    if (settings.modelPrices[cacheKey]) {
-        const userPrice = settings.modelPrices[cacheKey];
+    const configured = configuredPrice(settings, cacheKey);
+    if (configured) {
+        const userPrice = configured.price;
         const resolved = {
             in: parseFloat(userPrice?.in) || 0,
             out: parseFloat(userPrice?.out) || 0
@@ -1447,39 +1452,6 @@ function getModelPrice(modelId) {
 }
 
 /**
- * Set price settings for a model
- * @param {string} modelId
- * @param {number} priceIn - Price per 1M input tokens
- * @param {number} priceOut - Price per 1M output tokens
- */
-function setModelPrice(modelId, priceIn, priceOut) {
-    setModelPrices([modelId], priceIn, priceOut);
-}
-
-/**
- * Set the same price for multiple models and persist once.
- * @param {string[]} modelIds
- * @param {number} priceIn - Price per 1M input tokens
- * @param {number} priceOut - Price per 1M output tokens
- */
-function setModelPrices(modelIds, priceIn, priceOut) {
-    const settings = getSettings();
-    const price = {
-        in: parseFloat(priceIn) || 0,
-        out: parseFloat(priceOut) || 0
-    };
-
-    for (const modelId of new Set(modelIds)) {
-        if (!modelId) continue;
-        settings.modelPrices[modelId] = { ...price };
-    }
-
-    invalidateModelPriceCache();
-    modelConfigState.needsRefresh = true;
-    saveSettings();
-}
-
-/**
  * Calculate cost for a given token usage and model
  * @param {number} inputTokens
  * @param {number} outputTokens
@@ -1529,11 +1501,13 @@ function calculateEfficiencyMetrics(data) {
 function exportUsageData() {
     const settings = getSettings();
     return {
-        version: '1.0',
+        version: '1.1',
         exportDate: getCurrentEasternTime().toISOString(),
         extensionName: extensionName,
         usage: settings.usage,
         modelPrices: settings.modelPrices,
+        sharedModelPrices: settings.sharedModelPrices,
+        modelPriceGroups: settings.modelPriceGroups,
         modelColors: settings.modelColors
     };
 }
@@ -1559,6 +1533,10 @@ function importUsageData(jsonString) {
     if (data.extensionName && data.extensionName !== extensionName) {
         throw new Error(`Data was exported from a different extension: ${data.extensionName}`);
     }
+
+    // Validate before changing usage or settings. Restore complete pricing state
+    // so removed overrides cannot reappear when importing a new-format backup.
+    const pricingSnapshot = readPricingSnapshot(data);
 
     const settings = getSettings();
 
@@ -1622,11 +1600,16 @@ function importUsageData(jsonString) {
     }
 
     // Replace model prices (overwrite existing)
-    if (data.modelPrices) {
-        Object.assign(settings.modelPrices, data.modelPrices);
+    if (pricingSnapshot) {
+        Object.assign(settings, pricingSnapshot);
+        invalidateModelPriceCache();
+        modelConfigState.needsRefresh = true;
+    } else if (data.modelPrices) {
+        settings.modelPrices = { ...settings.modelPrices, ...data.modelPrices };
         invalidateModelPriceCache();
         modelConfigState.needsRefresh = true;
     }
+    modelConfigPriceDrafts.clear();
 
     // Replace model colors (overwrite existing)
     if (data.modelColors) {
@@ -1651,7 +1634,6 @@ let chartData = [];
 let tooltip = null;
 
 const MODEL_CONFIG_PAGE_SIZE = 50;
-const MODEL_CONFIG_PRICE_DEBOUNCE_MS = 500;
 const MODEL_CONFIG_SEARCH_DEBOUNCE_MS = 120;
 
 const modelConfigState = {
@@ -1667,8 +1649,8 @@ const modelConfigState = {
 };
 
 const modelPriceCache = new Map();
-const modelConfigPriceTimers = new Map();
 const modelConfigPriceDrafts = new Map();
+const expandedPriceGroups = new Set();
 let modelConfigSearchTimer = null;
 let modelConfigRenderRaf = null;
 let modelConfigPendingStats = null;
@@ -3293,16 +3275,8 @@ function updateModelConfigControls(totalModels, filteredCount, startIndex, endIn
     const pageLabel = $('#token-usage-model-page-label');
     const prevBtn = $('#token-usage-model-prev');
     const nextBtn = $('#token-usage-model-next');
-    const bulkApplyBtn = $('#token-usage-bulk-apply');
 
     if (!summary.length || !pageLabel.length || !prevBtn.length || !nextBtn.length) return;
-
-    if (bulkApplyBtn.length) {
-        const buttonLabel = modelConfigState.query
-            ? `Apply to ${filteredCount} match${filteredCount === 1 ? '' : 'es'}`
-            : `Apply to all ${filteredCount}`;
-        bulkApplyBtn.text(buttonLabel).prop('disabled', filteredCount === 0);
-    }
 
     if (totalModels === 0) {
         summary.text('No models tracked yet');
@@ -3323,7 +3297,7 @@ function updateModelConfigControls(totalModels, filteredCount, startIndex, endIn
     if (filteredCount !== totalModels) {
         summary.text(`Showing ${startIndex}-${endIndex} of ${filteredCount} matches (${totalModels} total)`);
     } else {
-        summary.text(`Showing ${startIndex}-${endIndex} of ${totalModels} models`);
+        summary.text(`Showing ${startIndex}-${endIndex} of ${totalModels} model groups`);
     }
 
     pageLabel.text(`${modelConfigState.page} / ${totalPages}`);
@@ -3371,122 +3345,105 @@ function bindModelConfigControls() {
     const searchInput = $('#token-usage-model-search');
     const prevBtn = $('#token-usage-model-prev');
     const nextBtn = $('#token-usage-model-next');
-    const bulkApplyBtn = $('#token-usage-bulk-apply');
     const grid = $('#token-usage-model-colors-grid');
 
     searchInput.off('.tokenUsageConfig');
     prevBtn.off('.tokenUsageConfig');
     nextBtn.off('.tokenUsageConfig');
-    bulkApplyBtn.off('.tokenUsageConfig');
     grid.off('.tokenUsageConfig');
 
     searchInput.on('input.tokenUsageConfig', function () {
         const rawQuery = String($(this).val() || '');
         clearTimeout(modelConfigSearchTimer);
         modelConfigSearchTimer = setTimeout(() => {
-            const normalizedQuery = rawQuery.trim().toLowerCase();
-            if (normalizedQuery === modelConfigState.query) return;
-            modelConfigState.query = normalizedQuery;
+            modelConfigState.query = rawQuery.trim().toLowerCase();
             modelConfigState.page = 1;
-            modelConfigState.needsRefresh = true;
             scheduleModelConfigRender(null, true);
         }, MODEL_CONFIG_SEARCH_DEBOUNCE_MS);
     });
-
     prevBtn.on('click.tokenUsageConfig', () => {
-        if (modelConfigState.page <= 1) return;
-        modelConfigState.page -= 1;
-        modelConfigState.needsRefresh = true;
+        modelConfigState.page = Math.max(1, modelConfigState.page - 1);
         scheduleModelConfigRender(null, true);
     });
-
     nextBtn.on('click.tokenUsageConfig', () => {
         modelConfigState.page += 1;
-        modelConfigState.needsRefresh = true;
         scheduleModelConfigRender(null, true);
     });
 
-    bulkApplyBtn.on('click.tokenUsageConfig', () => {
-        // Use the live search value so a click immediately after typing cannot
-        // apply to the previous debounced filter.
-        clearTimeout(modelConfigSearchTimer);
-        const query = String(searchInput.val() || '').trim().toLowerCase();
-        if (query !== modelConfigState.query) {
-            modelConfigState.query = query;
-            modelConfigState.page = 1;
-        }
-
-        const stats = getUsageStats();
-        const models = Object.keys(stats.byModel || {}).sort();
-        const filteredModels = query
-            ? models.filter(model => model.toLowerCase().includes(query))
-            : models;
-
-        if (filteredModels.length === 0) {
-            toastr.warning('No models match the current search');
-            scheduleModelConfigRender(stats, true);
-            return;
-        }
-
-        const rawPriceIn = String($('#token-usage-bulk-price-in').val() ?? '').trim();
-        const rawPriceOut = String($('#token-usage-bulk-price-out').val() ?? '').trim();
-        const priceIn = Number(rawPriceIn);
-        const priceOut = Number(rawPriceOut);
-
-        if (rawPriceIn === '' || rawPriceOut === ''
-            || !Number.isFinite(priceIn) || !Number.isFinite(priceOut)
-            || priceIn < 0 || priceOut < 0) {
-            toastr.warning('Enter valid non-negative input and output prices');
-            return;
-        }
-
-        // A pending single-row edit should not overwrite the bulk operation.
-        for (const modelId of filteredModels) {
-            const pendingTimer = modelConfigPriceTimers.get(modelId);
-            if (pendingTimer) clearTimeout(pendingTimer);
-            modelConfigPriceTimers.delete(modelId);
-            modelConfigPriceDrafts.delete(modelId);
-        }
-
-        setModelPrices(filteredModels, priceIn, priceOut);
-        updateUIStats();
-        scheduleModelConfigRender(stats, true);
-        toastr.success(`Updated pricing for ${filteredModels.length} model${filteredModels.length === 1 ? '' : 's'}`);
+    grid.on('click.tokenUsageConfig', '.price-group-toggle', function () {
+        const group = $(this).attr('data-group');
+        if (expandedPriceGroups.has(group)) expandedPriceGroups.delete(group);
+        else expandedPriceGroups.add(group);
+        scheduleModelConfigRender(null, true);
     });
 
-    grid.on('change.tokenUsageConfig', '.model-color-picker', function () {
-        const modelId = String($(this).data('model') || '');
-        if (!modelId) return;
-        setModelColor(modelId, String($(this).val() || ''));
-        renderChartByType();
-    });
-
-    grid.on('input.tokenUsageConfig', '.price-input-in, .price-input-out', function () {
-        const modelId = String($(this).data('model') || '');
-        if (!modelId) return;
-
-        const row = $(this).closest('.model-config-row');
-        modelConfigPriceDrafts.set(modelId, {
+    // Explicit Save buttons keep partial input intact while stats refresh.
+    grid.on('input.tokenUsageConfig', '.price-editor input', function () {
+        const row = $(this).closest('.price-editor');
+        modelConfigPriceDrafts.set(row.attr('data-editor'), {
             in: String(row.find('.price-input-in').val() ?? ''),
             out: String(row.find('.price-input-out').val() ?? ''),
         });
-
-        const existingTimer = modelConfigPriceTimers.get(modelId);
-        if (existingTimer) {
-            clearTimeout(existingTimer);
-        }
-
-        const timer = setTimeout(() => {
-            const draft = modelConfigPriceDrafts.get(modelId);
-            modelConfigPriceTimers.delete(modelId);
-            if (!draft) return;
-            modelConfigPriceDrafts.delete(modelId);
-            setModelPrice(modelId, draft.in, draft.out);
-            updateUIStats();
-        }, MODEL_CONFIG_PRICE_DEBOUNCE_MS);
-
-        modelConfigPriceTimers.set(modelId, timer);
     });
+    grid.on('click.tokenUsageConfig', '.price-save', function () {
+        const row = $(this).closest('.price-editor');
+        const price = parsePrice(row.find('.price-input-in').val(), row.find('.price-input-out').val());
+        if (!price) {
+            toastr.warning('Enter both prices as non-negative numbers. Use 0 for free tokens.');
+            return;
+        }
+        const settings = getSettings();
+        const group = row.attr('data-group');
+        const model = row.attr('data-model');
+        if (group) saveSharedPrice(settings, group, price);
+        else settings.modelPrices = { ...settings.modelPrices, [model]: price };
+        modelConfigPriceDrafts.delete(row.attr('data-editor'));
+        refreshPricing();
+        toastr.success(group ? 'Shared price saved; individual overrides kept' : 'Model override saved');
+    });
+    grid.on('click.tokenUsageConfig', '.price-inherit', function () {
+        const model = $(this).attr('data-model');
+        delete getSettings().modelPrices[model];
+        modelConfigPriceDrafts.delete('model:' + model);
+        refreshPricing();
+    });
+    grid.on('click.tokenUsageConfig', '.price-auto', function () {
+        const group = $(this).attr('data-group');
+        delete getSettings().sharedModelPrices[group];
+        modelConfigPriceDrafts.delete('group:' + group);
+        refreshPricing();
+    });
+    grid.on('change.tokenUsageConfig', '.price-group-link', function () {
+        const model = $(this).attr('data-model');
+        const group = String($(this).val() || '');
+        if (!group) return;
+        getSettings().modelPriceGroups = { ...getSettings().modelPriceGroups, [model]: group };
+        expandedPriceGroups.add(group);
+        modelConfigPriceDrafts.delete('model:' + model);
+        refreshPricing();
+    });
+    grid.on('click.tokenUsageConfig', '.price-separate', function () {
+        const model = $(this).attr('data-model');
+        const settings = getSettings();
+        // Preserve the effective price when moving out of a shared group.
+        if (configuredPrice(settings, model)) settings.modelPrices = { ...settings.modelPrices, [model]: { ...getModelPrice(model) } };
+        settings.modelPriceGroups = { ...settings.modelPriceGroups, [model]: 'exact:' + model };
+        expandedPriceGroups.add('exact:' + model);
+        modelConfigPriceDrafts.delete('model:' + model);
+        refreshPricing();
+    });
+    grid.on('change.tokenUsageConfig', '.model-color-picker', function () {
+        setModelColor($(this).attr('data-model'), String($(this).val() || ''));
+        renderChartByType();
+    });
+}
+
+function refreshPricing() {
+    invalidateModelPriceCache();
+    modelConfigState.needsRefresh = true;
+    saveSettings();
+    updateUIStats();
+    scheduleModelConfigRender(null, true);
 }
 
 function observeModelConfigVisibility() {
@@ -3514,90 +3471,93 @@ function observeModelConfigVisibility() {
  */
 function renderModelColorsGrid(statsParam, options = {}) {
     const grid = $('#token-usage-model-colors-grid');
-    if (grid.length === 0) return;
-
-    const force = Boolean(options.force);
-    if (!isModelConfigVisible() && !force) {
+    if (!grid.length) return;
+    if (!isModelConfigVisible() && !options.force) {
         modelConfigState.needsRefresh = true;
         return;
     }
-
     const stats = statsParam || getUsageStats();
-    const models = Object.keys(stats.byModel || {}).sort();
+    const settings = getSettings();
+    const models = Object.keys(stats.byModel || {});
     const signature = models.join('\u0001');
-
-    modelConfigState.lastModelCount = models.length;
-
-    const query = modelConfigState.query;
-    const filtered = query
-        ? models.filter(model => model.toLowerCase().includes(query))
-        : models;
-
-    const totalPages = Math.max(1, Math.ceil(filtered.length / modelConfigState.pageSize));
-    modelConfigState.page = Math.min(Math.max(modelConfigState.page, 1), totalPages);
-
-    const shouldSkipRender = !force
-        && !modelConfigState.needsRefresh
+    if (!options.force && !modelConfigState.needsRefresh
         && modelConfigState.lastRenderedSignature === signature
         && modelConfigState.lastRenderedPage === modelConfigState.page
-        && modelConfigState.lastRenderedQuery === modelConfigState.query;
+        && modelConfigState.lastRenderedQuery === modelConfigState.query) return;
 
-    if (shouldSkipRender) {
-        return;
-    }
-
-    if (models.length === 0) {
-        grid.empty().append('<div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.5; padding: 8px; text-align: center;">No models tracked yet</div>');
-        updateModelConfigControls(0, 0, 0, 0, 0);
-        modelConfigState.lastRenderedSignature = signature;
-        modelConfigState.lastRenderedPage = 1;
-        modelConfigState.lastRenderedQuery = modelConfigState.query;
-        modelConfigState.needsRefresh = false;
-        return;
-    }
-
-    if (filtered.length === 0) {
-        grid.empty().append('<div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.5; padding: 8px; text-align: center;">No matching models</div>');
-        updateModelConfigControls(models.length, 0, 0, 0, 0);
-        modelConfigState.lastRenderedSignature = signature;
-        modelConfigState.lastRenderedPage = 1;
-        modelConfigState.lastRenderedQuery = modelConfigState.query;
-        modelConfigState.needsRefresh = false;
-        return;
-    }
-
-    const startIndex = (modelConfigState.page - 1) * modelConfigState.pageSize;
-    const endIndex = Math.min(startIndex + modelConfigState.pageSize, filtered.length);
-    const pageModels = filtered.slice(startIndex, endIndex);
-
-    let rowsHtml = '';
-    for (const model of pageModels) {
-        const color = getModelColor(model);
-        const prices = getModelPrice(model);
-        const priceIn = prices.in > 0 ? String(prices.in) : '';
-        const priceOut = prices.out > 0 ? String(prices.out) : '';
-        const safeModel = escapeHtml(model);
-
-        rowsHtml += `
-            <div class="model-config-row" style="display: flex; align-items: center; gap: 4px; min-width: 0;">
-                <input type="color" value="${color}" data-model="${safeModel}"
-                       class="model-color-picker"
-                       style="width: 20px; height: 20px; padding: 0; border: none; cursor: pointer; flex-shrink: 0; border-radius: 4px;">
-                <span title="${safeModel}" style="font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--SmartThemeBodyColor); flex: 1;">${safeModel}</span>
-                <span style="font-size: 8px; color: var(--SmartThemeBodyColor); opacity: 0.5; flex-shrink: 0;">Price</span>
-                <input type="number" class="price-input-in" data-model="${safeModel}" value="${priceIn}" step="0.01" min="0" placeholder="In" title="Price per 1M input tokens" style="width: 40px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
-                <input type="number" class="price-input-out" data-model="${safeModel}" value="${priceOut}" step="0.01" min="0" placeholder="Out" title="Price per 1M output tokens" style="width: 40px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
-            </div>
-        `;
-    }
-
-    grid.html(rowsHtml);
-    updateModelConfigControls(models.length, filtered.length, startIndex + 1, endIndex, totalPages);
-
+    const groups = collectPriceGroups(settings, models);
+    const query = modelConfigState.query;
+    const filtered = groups.filter(group => !query || group.name.toLowerCase().includes(query)
+        || group.models.some(model => model.toLowerCase().includes(query)));
+    const pages = Math.max(1, Math.ceil(filtered.length / modelConfigState.pageSize));
+    modelConfigState.page = Math.min(Math.max(1, modelConfigState.page), pages);
+    const start = (modelConfigState.page - 1) * modelConfigState.pageSize;
+    const pageGroups = filtered.slice(start, start + modelConfigState.pageSize);
+    grid.html(pageGroups.length
+        ? pageGroups.map(group => renderPriceGroup(group, groups, settings)).join('')
+        : '<div class="price-empty">No matching model groups</div>');
+    updateModelConfigControls(groups.length, filtered.length,
+        start + 1, Math.min(start + pageGroups.length, filtered.length), pages);
+    modelConfigState.lastModelCount = models.length;
     modelConfigState.lastRenderedSignature = signature;
     modelConfigState.lastRenderedPage = modelConfigState.page;
-    modelConfigState.lastRenderedQuery = modelConfigState.query;
+    modelConfigState.lastRenderedQuery = query;
     modelConfigState.needsRefresh = false;
+}
+
+function renderPriceEditor(key, price, attributes, buttonLabel) {
+    const draft = modelConfigPriceDrafts.get(key);
+    const value = draft || price || { in: '', out: '' };
+    return `<div class="price-editor" data-editor="${escapeHtml(key)}" ${attributes}>
+        <label>Input <input type="number" class="price-input-in" min="0" step="any"
+            value="${escapeHtml(value.in)}" placeholder="$/1M" aria-label="Input price per million tokens"></label>
+        <label>Output <input type="number" class="price-input-out" min="0" step="any"
+            value="${escapeHtml(value.out)}" placeholder="$/1M" aria-label="Output price per million tokens"></label>
+        <button type="button" class="menu_button price-save">${buttonLabel}</button>
+    </div>`;
+}
+
+function renderPriceGroup(group, groups, settings) {
+    const safeGroup = escapeHtml(group.id);
+    const shared = settings.sharedModelPrices?.[group.id];
+    const expanded = expandedPriceGroups.has(group.id);
+    const overrideCount = group.models.filter(model => Object.hasOwn(settings.modelPrices, model)).length;
+    const status = shared ? 'Shared price' : 'Suggested group · no shared price';
+    const options = expanded ? groups.filter(other => other.id !== group.id)
+        .map(other => `<option value="${escapeHtml(other.id)}">${escapeHtml(other.name)}${other.id.startsWith('exact:') ? ' (separate)' : ''}</option>`).join('') : '';
+    const variants = expanded ? group.models.map(model => {
+        const safeModel = escapeHtml(model);
+        const configured = configuredPrice(settings, model);
+        const override = configured?.source === 'Override';
+        const price = getModelPrice(model);
+        const source = configured?.source || 'Auto / unpriced';
+        return `<div class="price-variant">
+            <div class="price-variant-heading">
+                <input type="color" class="model-color-picker" data-model="${safeModel}"
+                    value="${escapeHtml(getModelColor(model))}" aria-label="Chart color for ${safeModel}">
+                <span class="price-model-name" title="${safeModel}">${safeModel}</span>
+                <span class="price-source">${source}</span>
+            </div>
+            ${renderPriceEditor('model:' + model, price, `data-model="${safeModel}"`, 'Save override')}
+            <div class="price-variant-actions">
+                ${override ? `<button type="button" class="menu_button price-inherit" data-model="${safeModel}">${shared ? 'Use shared' : 'Use auto'}</button>` : ''}
+                ${options ? `<label>Link to <select class="price-group-link" data-model="${safeModel}" aria-label="Pricing group for ${safeModel}">
+                    <option value="">Choose group…</option>${options}</select></label>` : ''}
+                ${group.id !== 'exact:' + model ? `<button type="button" class="menu_button price-separate" data-model="${safeModel}">Separate</button>` : ''}
+            </div>
+        </div>`;
+    }).join('') : '';
+    return `<section class="price-group">
+        <button type="button" class="price-group-toggle" data-group="${safeGroup}" aria-expanded="${expanded}">
+            <span aria-hidden="true">${expanded ? '▾' : '▸'}</span>
+            <span class="price-model-name" title="${escapeHtml(group.name)}">${escapeHtml(group.name)}</span>
+            <span class="price-group-count">${group.models.length} variant${group.models.length === 1 ? '' : 's'}</span>
+        </button>
+        <div class="price-group-status">${status}${overrideCount ? ` · ${overrideCount} override${overrideCount === 1 ? '' : 's'}` : ''}</div>
+        ${renderPriceEditor('group:' + group.id, shared, `data-group="${safeGroup}"`, 'Save shared')}
+        ${shared ? `<button type="button" class="menu_button price-auto" data-group="${safeGroup}">Use automatic pricing</button>` : ''}
+        ${expanded ? `<div class="price-variants">${variants || '<div class="price-empty">New matching variants will appear here.</div>'}</div>` : ''}
+    </section>`;
 }
 
 /**
@@ -3774,14 +3734,10 @@ function createSettingsUI() {
                                     <button id="token-usage-model-next" class="menu_button" style="padding: 2px 6px; font-size: 10px;">Next</button>
                                 </div>
                             </div>
-                            <div class="token-usage-bulk-price" title="Set the same price for every model matched by the search, including models on other pages">
-                                <label for="token-usage-bulk-price-in">Bulk <span>$/1M</span></label>
-                                <input id="token-usage-bulk-price-in" type="number" min="0" step="0.01" placeholder="Input" aria-label="Bulk input price per 1 million tokens">
-                                <input id="token-usage-bulk-price-out" type="number" min="0" step="0.01" placeholder="Output" aria-label="Bulk output price per 1 million tokens">
-                                <button id="token-usage-bulk-apply" class="menu_button" type="button" disabled>Apply to all 0</button>
-                            </div>
+                            <p class="price-help">Prices in $ per million tokens. Save a shared price for all linked variants, including future matches. Expand a model to override or link variants.</p>
+                            <p class="price-help">On first save, identical existing prices inherit the shared price; different prices stay as overrides. Search filters groups, not which variants share the price.</p>
                             <div id="token-usage-model-summary" style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.55; margin-bottom: 6px;">No models tracked yet</div>
-                            <div id="token-usage-model-colors-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px;"></div>
+                            <div id="token-usage-model-colors-grid"></div>
                         </div>
                     </div>
 
