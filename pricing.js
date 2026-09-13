@@ -76,6 +76,23 @@ export function saveSharedPrice(settings, groupId, price) {
     return adopted;
 }
 
+export function matchingPriceModels(settings, trackedModels, query) {
+    const search = String(query || '').trim().toLowerCase();
+    const models = new Set([...trackedModels, ...Object.keys(settings.modelPrices || {}),
+        ...Object.keys(settings.modelPriceGroups || {})]);
+    return [...models].filter(model => model.toLowerCase().includes(search)).sort();
+}
+
+export function applyMatchingPrices(settings, trackedModels, query, input, output) {
+    const price = parsePrice(input, output);
+    if (!price) throw new Error('Enter both prices as non-negative numbers. Use 0 for free tokens.');
+    const models = matchingPriceModels(settings, trackedModels, query);
+    if (!models.length) return models;
+    settings.modelPrices = { ...settings.modelPrices,
+        ...Object.fromEntries(models.map(model => [model, { ...price }])) };
+    return models;
+}
+
 export function readPricingSnapshot(data) {
     if (!Object.hasOwn(data, 'sharedModelPrices') && !Object.hasOwn(data, 'modelPriceGroups')) return null;
     const record = value => value && typeof value === 'object' && !Array.isArray(value);

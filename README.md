@@ -56,6 +56,8 @@ Once installed, the extension will automatically start tracking token usage. The
 
 ### Shared model pricing
 
+For a quick bulk update, search in **Config**, type the input/output prices in the fields immediately below the search, then click **Apply to N matching models**. This updates every matching model ID across all pages, replacing any existing individual prices. Matching is case-insensitive; an empty search applies to all known models. Only matching model IDs change, even when other aliases appear in the same expanded group. This is a one-time update; shared group rates and links remain unchanged.
+
 Open **Token Usage Tracker → Config**, search for a model, enter input/output prices in **$/1M tokens**, and click **Save shared**. Every linked variant uses this price unless it has an individual override. Future matching variants inherit it too.
 
 - Expand a model to see each variant, its effective price, and whether it uses shared pricing, an override, or automatic pricing.

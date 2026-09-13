@@ -15,7 +15,7 @@ import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.j
 import { SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
 import { getChatCompletionModel, oai_settings } from '../../../openai.js';
 import { textgenerationwebui_settings as textgen_settings } from '../../../textgen-settings.js';
-import { parsePrice, configuredPrice, collectPriceGroups, saveSharedPrice, readPricingSnapshot } from './pricing.js';
+import { parsePrice, configuredPrice, collectPriceGroups, saveSharedPrice, readPricingSnapshot, matchingPriceModels, applyMatchingPrices } from './pricing.js';
 
 const extensionName = 'token-usage-tracker';
 
@@ -3352,6 +3352,28 @@ function bindModelConfigControls() {
     nextBtn.off('.tokenUsageConfig');
     grid.off('.tokenUsageConfig');
 
+    $('#token-usage-bulk-apply').off('.tokenUsageConfig').on('click.tokenUsageConfig', () => {
+        // Read the live search so a click before the search debounce finishes
+        // never applies prices to an earlier query or just the current page.
+        const query = String(searchInput.val() || '').trim().toLowerCase();
+        try {
+            const models = applyMatchingPrices(getSettings(), Object.keys(getUsageStats().byModel || {}), query,
+                $('#token-usage-bulk-in').val(), $('#token-usage-bulk-out').val());
+            if (!models.length) {
+                toastr.warning('No model IDs match this search');
+                return;
+            }
+            clearTimeout(modelConfigSearchTimer);
+            if (query !== modelConfigState.query) modelConfigState.page = 1;
+            modelConfigState.query = query;
+            for (const model of models) modelConfigPriceDrafts.delete('model:' + model);
+            refreshPricing();
+            toastr.success(`Updated pricing for ${models.length} matching model${models.length === 1 ? '' : 's'}`);
+        } catch (error) {
+            toastr.warning(error.message);
+        }
+    });
+
     searchInput.on('input.tokenUsageConfig', function () {
         const rawQuery = String($(this).val() || '');
         clearTimeout(modelConfigSearchTimer);
@@ -3487,6 +3509,10 @@ function renderModelColorsGrid(statsParam, options = {}) {
 
     const groups = collectPriceGroups(settings, models);
     const query = modelConfigState.query;
+    const matchCount = matchingPriceModels(settings, models, query).length;
+    $('#token-usage-bulk-apply')
+        .text(query ? `Apply to ${matchCount} matching models` : `Apply to all ${matchCount} models`)
+        .prop('disabled', matchCount === 0);
     const filtered = groups.filter(group => !query || group.name.toLowerCase().includes(query)
         || group.models.some(model => model.toLowerCase().includes(query)));
     const pages = Math.max(1, Math.ceil(filtered.length / modelConfigState.pageSize));
@@ -3734,7 +3760,13 @@ function createSettingsUI() {
                                     <button id="token-usage-model-next" class="menu_button" style="padding: 2px 6px; font-size: 10px;">Next</button>
                                 </div>
                             </div>
-                            <p class="price-help">Prices in $ per million tokens. Save a shared price for all linked variants, including future matches. Expand a model to override or link variants.</p>
+                            <div id="token-usage-bulk-pricing" class="price-editor">
+                                <label>Input $/1M <input id="token-usage-bulk-in" type="number" min="0" step="any" placeholder="Input price" aria-label="Bulk input price per million tokens"></label>
+                                <label>Output $/1M <input id="token-usage-bulk-out" type="number" min="0" step="any" placeholder="Output price" aria-label="Bulk output price per million tokens"></label>
+                                <button id="token-usage-bulk-apply" type="button" class="menu_button" disabled>Apply to matching models</button>
+                            </div>
+                            <p class="price-help">Apply updates every model ID matching your search across all pages, including existing overrides. An empty search updates all models.</p>
+                            <p class="price-help">For ongoing shared pricing, save a group's shared price below. Expand a model to override or link variants.</p>
                             <p class="price-help">On first save, identical existing prices inherit the shared price; different prices stay as overrides. Search filters groups, not which variants share the price.</p>
                             <div id="token-usage-model-summary" style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.55; margin-bottom: 6px;">No models tracked yet</div>
                             <div id="token-usage-model-colors-grid"></div>
