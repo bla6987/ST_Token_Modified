@@ -35,8 +35,14 @@ A SillyTavern extension that tracks and visualizes token usage and price for you
 
 ### Charts & Visualization
 - Daily and hourly usage charts
+- **Tokens | Generations** metric toggle
 - Multiple time range options: **1D (Today)**, 7D, 30D, 90D
 - Improved hourly chart readability
+
+### Generation Metrics
+- Generation counts per hour/day, available for your whole history
+- Stopped and failed generation attempts, with success rate, tracked from version 1.2.0 onward
+- `/tokentoday` shows today's and this hour's generations, stopped, failed and success rate
 
 ### Time Synchronization
 - External time sync with worldtimeapi.org for Eastern timezone
@@ -72,7 +78,19 @@ Existing prices are preserved on upgrade. The first time a shared price is saved
 
 `/tokenexport` and `/tokenimport` include shared prices and manual links. New-format backups restore the complete pricing configuration; older backups continue to merge exact-model prices.
 
-Run the pricing regression tests with `node --test tests/pricing.test.mjs` (Node 22.7+).
+### Generation metrics
+
+Switch the chart to **Generations** to plot how many generations ran per hour or day. A generation is one recorded response: normal, swipe, continue, impersonate, quiet/background (Summarize, Guided Generations, etc.), and stopped generations with partial output.
+
+- **Past data:** generation counts exist for all history, but only as a total. Per-model and per-source counts start with version 1.2.0, so older bars are drawn as one neutral block and show 0 when a source filter is selected.
+- **Stopped:** you stopped the generation. Its input and any partial output still count toward tokens.
+- **Failed:** the attempt ended without a result (for example a rate-limit, server or network error, or an error response). Failed attempts add no tokens.
+- **Attempts** = generations + failed. **Success rate** = (generations − stopped) ÷ attempts.
+- Periods that began before stopped/failed tracking started show **—** instead of a success rate.
+
+Failures are inferred from SillyTavern's generation lifecycle and each request's result; there is no per-status-code breakdown (a 429 usually reaches the browser as a generic error). Calls made with `generateRaw` are not tracked.
+
+Run the regression tests with `node --test tests/` (Node 22.7+).
 
 ## Credits
 

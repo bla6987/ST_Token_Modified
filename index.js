@@ -8,6 +8,8 @@
  */
 
 import { eventSource, event_types, main_api, streamingProcessor, saveSettingsDebounced } from '../../../../script.js';
+// Namespace import: optional helpers must not break loading on older SillyTavern versions
+import * as stScript from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import { getTokenCountAsync, getFriendlyTokenizerName } from '../../../tokenizers.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
@@ -16,6 +18,7 @@ import { SlashCommandArgument } from '../../../slash-commands/SlashCommandArgume
 import { getChatCompletionModel, oai_settings } from '../../../openai.js';
 import { textgenerationwebui_settings as textgen_settings } from '../../../textgen-settings.js';
 import { parsePrice, configuredPrice, collectPriceGroups, saveSharedPrice, readPricingSnapshot, matchingPriceModels, applyMatchingPrices } from './pricing.js';
+import { bumpCounts, generationStats, generationPoint, hasCompleteOutcomes, countAxisScale, createAttemptTracker } from './metrics.js';
 
 const extensionName = 'token-usage-tracker';
 
@@ -152,6 +155,8 @@ const defaultSettings = {
         byModel: {},
         // Per-source usage: { "openai": { input: X, output: Y, total: Z, messageCount: N }, ... }
         bySource: {},
+        // When stopped/failed counting began (ISO); older buckets have no outcome data
+        outcomesTrackedSince: null,
     },
 };
 
@@ -176,6 +181,9 @@ function loadSettings() {
     if (!settings.usage.byChat) settings.usage.byChat = {};
     if (!settings.usage.byModel) settings.usage.byModel = {};
     if (!settings.usage.bySource) settings.usage.bySource = {};
+    if (!settings.usage.outcomesTrackedSince) {
+        settings.usage.outcomesTrackedSince = getCurrentEasternTime().toISOString();
+    }
 
     // Initialize modelPrices
     if (!settings.modelPrices) settings.modelPrices = {};
@@ -432,113 +440,65 @@ async function maybeAutoFetchOpenRouterPricing() {
 }
 
 /**
- * Record token usage into all relevant buckets
- * @param {number} inputTokens - Tokens in the user message
- * @param {number} outputTokens - Tokens in the AI response (excluding reasoning)
- * @param {string} [chatId] - Optional chat ID for per-chat tracking
- * @param {string} [modelId] - Optional model ID for per-model tracking
- * @param {string} [sourceId] - Optional source ID for per-source tracking
- * @param {number} [reasoningTokens] - Optional reasoning/thinking tokens (Claude, o1, etc.)
+ * Add tokens and generation counters to every usage bucket for one generation or attempt
+ * @param {{input: number, output: number, reasoning: number}} tokens
+ * @param {{messageCount?: number, stopped?: number, failed?: number}} counts
+ * @param {string|null} chatId
+ * @param {string|null} modelId
+ * @param {string|null} sourceId
  */
-function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, sourceId = null, reasoningTokens = 0) {
-    const settings = getSettings();
-    const usage = settings.usage;
+function addToUsageBuckets(tokens, counts, chatId, modelId, sourceId) {
+    const usage = getSettings().usage;
     const now = getCurrentEasternTime();
-    const totalTokens = inputTokens + outputTokens + reasoningTokens;
+    const { input, output, reasoning } = tokens;
+    const total = input + output + reasoning;
 
+    // Top-level buckets track reasoning separately
     const addTokens = (bucket) => {
-        bucket.input = (bucket.input || 0) + inputTokens;
-        bucket.output = (bucket.output || 0) + outputTokens;
-        bucket.reasoning = (bucket.reasoning || 0) + reasoningTokens;
-        bucket.total = (bucket.total || 0) + totalTokens;
-        bucket.messageCount = (bucket.messageCount || 0) + 1;
+        bucket.input = (bucket.input || 0) + input;
+        bucket.output = (bucket.output || 0) + output;
+        bucket.reasoning = (bucket.reasoning || 0) + reasoning;
+        bucket.total = (bucket.total || 0) + total;
+        bumpCounts(bucket, counts);
     };
 
-    // Session
-    addTokens(usage.session);
+    // Nested model/source entries (used for cost, stacking and filtering) have no reasoning field
+    const addNested = (parent, key, id, create = () => ({ input: 0, output: 0, total: 0 })) => {
+        if (!parent[key]) parent[key] = {};
+        if (!parent[key][id]) parent[key][id] = create();
+        const entry = parent[key][id];
+        entry.input = (entry.input || 0) + input;
+        entry.output = (entry.output || 0) + output;
+        entry.total = (entry.total || 0) + total;
+        bumpCounts(entry, counts);
+        return entry;
+    };
 
-    // Track model within session for accurate cost calculation
-    if (modelId) {
-        if (!usage.session.models) usage.session.models = {};
-        if (!usage.session.models[modelId]) {
-            usage.session.models[modelId] = { input: 0, output: 0, total: 0 };
-        }
-        usage.session.models[modelId].input += inputTokens;
-        usage.session.models[modelId].output += outputTokens;
-        usage.session.models[modelId].total += totalTokens;
-    }
+    // Session (with models for accurate cost calculation)
+    addTokens(usage.session);
+    if (modelId) addNested(usage.session, 'models', modelId);
 
     // All-time
     addTokens(usage.allTime);
 
-    // By day
+    // By day, with models for the stacked chart and sources (and their models) for filtering
     const dayKey = getDayKey(now);
     if (!usage.byDay[dayKey]) usage.byDay[dayKey] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, models: {}, sources: {} };
-    addTokens(usage.byDay[dayKey]);
-
-    // Track model within day for stacked chart (with input/output breakdown for cost calculation)
-    if (modelId) {
-        if (!usage.byDay[dayKey].models) usage.byDay[dayKey].models = {};
-        if (!usage.byDay[dayKey].models[modelId]) {
-            usage.byDay[dayKey].models[modelId] = { input: 0, output: 0, total: 0 };
-        }
-        const modelData = usage.byDay[dayKey].models[modelId];
-        modelData.input += inputTokens;
-        modelData.output += outputTokens;
-        modelData.total += totalTokens;
-    }
-
-    // Track source within day for filtering
+    const dayData = usage.byDay[dayKey];
+    addTokens(dayData);
+    if (modelId) addNested(dayData, 'models', modelId);
     if (sourceId) {
-        if (!usage.byDay[dayKey].sources) usage.byDay[dayKey].sources = {};
-        if (!usage.byDay[dayKey].sources[sourceId]) {
-            usage.byDay[dayKey].sources[sourceId] = { input: 0, output: 0, total: 0, models: {} };
-        }
-        const sourceData = usage.byDay[dayKey].sources[sourceId];
-        sourceData.input += inputTokens;
-        sourceData.output += outputTokens;
-        sourceData.total += totalTokens;
-
-        // Also track model within source for the day (for filtered chart stacking)
-        if (modelId) {
-            if (!sourceData.models) sourceData.models = {};
-            if (!sourceData.models[modelId]) {
-                sourceData.models[modelId] = { input: 0, output: 0, total: 0 };
-            }
-            sourceData.models[modelId].input += inputTokens;
-            sourceData.models[modelId].output += outputTokens;
-            sourceData.models[modelId].total += totalTokens;
-        }
+        const sourceData = addNested(dayData, 'sources', sourceId, () => ({ input: 0, output: 0, total: 0, models: {} }));
+        if (modelId) addNested(sourceData, 'models', modelId);
     }
 
     // By hour
     const hourKey = getHourKey(now);
     if (!usage.byHour[hourKey]) usage.byHour[hourKey] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, models: {}, sources: {} };
-    addTokens(usage.byHour[hourKey]);
-
-    // Track model within hour for cost calculation
-    if (modelId) {
-        if (!usage.byHour[hourKey].models) usage.byHour[hourKey].models = {};
-        if (!usage.byHour[hourKey].models[modelId]) {
-            usage.byHour[hourKey].models[modelId] = { input: 0, output: 0, total: 0 };
-        }
-        const hourModelData = usage.byHour[hourKey].models[modelId];
-        hourModelData.input += inputTokens;
-        hourModelData.output += outputTokens;
-        hourModelData.total += totalTokens;
-    }
-
-    // Track source within hour for filtering
-    if (sourceId) {
-        if (!usage.byHour[hourKey].sources) usage.byHour[hourKey].sources = {};
-        if (!usage.byHour[hourKey].sources[sourceId]) {
-            usage.byHour[hourKey].sources[sourceId] = { input: 0, output: 0, total: 0 };
-        }
-        const hourSourceData = usage.byHour[hourKey].sources[sourceId];
-        hourSourceData.input += inputTokens;
-        hourSourceData.output += outputTokens;
-        hourSourceData.total += totalTokens;
-    }
+    const hourData = usage.byHour[hourKey];
+    addTokens(hourData);
+    if (modelId) addNested(hourData, 'models', modelId);
+    if (sourceId) addNested(hourData, 'sources', sourceId);
 
     // By week
     const weekKey = getWeekKey(now);
@@ -550,22 +510,11 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, s
     if (!usage.byMonth[monthKey]) usage.byMonth[monthKey] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0 };
     addTokens(usage.byMonth[monthKey]);
 
-    // By chat
+    // By chat (with models for cost calculation)
     if (chatId) {
         if (!usage.byChat[chatId]) usage.byChat[chatId] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, models: {} };
         addTokens(usage.byChat[chatId]);
-
-        // Track model within chat for cost calculation
-        if (modelId) {
-            if (!usage.byChat[chatId].models) usage.byChat[chatId].models = {};
-            if (!usage.byChat[chatId].models[modelId]) {
-                usage.byChat[chatId].models[modelId] = { input: 0, output: 0, total: 0 };
-            }
-            const chatModelData = usage.byChat[chatId].models[modelId];
-            chatModelData.input += inputTokens;
-            chatModelData.output += outputTokens;
-            chatModelData.total += totalTokens;
-        }
+        if (modelId) addNested(usage.byChat[chatId], 'models', modelId);
     }
 
     // By model (aggregate)
@@ -579,6 +528,25 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, s
         if (!usage.bySource[sourceId]) usage.bySource[sourceId] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0 };
         addTokens(usage.bySource[sourceId]);
     }
+}
+
+/**
+ * Record token usage into all relevant buckets
+ * @param {number} inputTokens - Tokens in the user message
+ * @param {number} outputTokens - Tokens in the AI response (excluding reasoning)
+ * @param {string} [chatId] - Optional chat ID for per-chat tracking
+ * @param {string} [modelId] - Optional model ID for per-model tracking
+ * @param {string} [sourceId] - Optional source ID for per-source tracking
+ * @param {number} [reasoningTokens] - Optional reasoning/thinking tokens (Claude, o1, etc.)
+ * @param {'succeeded'|'stopped'} [outcome] - 'stopped' also counts the generation as stopped
+ */
+function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, sourceId = null, reasoningTokens = 0, outcome = 'succeeded') {
+    const stopped = outcome === 'stopped' ? 1 : 0;
+    addToUsageBuckets(
+        { input: inputTokens, output: outputTokens, reasoning: reasoningTokens },
+        { messageCount: 1, stopped },
+        chatId, modelId, sourceId,
+    );
 
     saveSettings();
 
@@ -588,7 +556,20 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, s
     // Emit custom event for UI updates
     eventSource.emit('tokenUsageUpdated', getUsageStats());
 
-    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${outputTokens} output, model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'} (using ${getFriendlyTokenizerName(main_api).tokenizerName})`);
+    console.log(`[Token Usage Tracker] Recorded${stopped ? ' stopped generation' : ''}: +${inputTokens} input, +${outputTokens} output, model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'} (using ${getFriendlyTokenizerName(main_api).tokenizerName})`);
+}
+
+/**
+ * Record a generation attempt that failed before producing a result (no tokens counted)
+ * @param {string} [chatId] - Optional chat ID for per-chat tracking
+ * @param {string} [modelId] - Optional model ID for per-model tracking
+ * @param {string} [sourceId] - Optional source ID for per-source tracking
+ */
+function recordFailedAttempt(chatId = null, modelId = null, sourceId = null) {
+    addToUsageBuckets({ input: 0, output: 0, reasoning: 0 }, { failed: 1 }, chatId, modelId, sourceId);
+    saveSettings();
+    eventSource.emit('tokenUsageUpdated', getUsageStats());
+    console.log(`[Token Usage Tracker] Recorded failed generation attempt, model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'}`);
 }
 
 /**
@@ -617,6 +598,7 @@ function resetAllUsage() {
     const settings = getSettings();
     settings.usage = structuredClone(defaultSettings.usage);
     settings.usage.session.startTime = getCurrentEasternTime().toISOString();
+    settings.usage.outcomesTrackedSince = settings.usage.session.startTime;
     saveSettings();
     eventSource.emit('tokenUsageUpdated', getUsageStats());
     console.log('[Token Usage Tracker] All usage data reset');
@@ -684,6 +666,26 @@ function getUsageForRange(startDate, endDate) {
 }
 
 /**
+ * Bucket keys for the day and hour in which stopped/failed tracking began
+ * @returns {{day: string|null, hour: string|null, since: Date|null}}
+ */
+function getOutcomeTrackingKeys() {
+    const since = new Date(getSettings().usage.outcomesTrackedSince || NaN);
+    if (Number.isNaN(since.getTime())) return { day: null, hour: null, since: null };
+    return { day: getDayKey(since), hour: getHourKey(since), since };
+}
+
+/**
+ * Format a success rate, or '—' when the period predates outcome tracking
+ * @param {{successRate: number|null}} stats - From generationStats()
+ * @param {boolean} complete - Whether the period has complete outcome data
+ * @returns {string}
+ */
+function formatSuccessRate(stats, complete) {
+    return complete && stats.successRate !== null ? `${(stats.successRate * 100).toFixed(1)}%` : '—';
+}
+
+/**
  * Get usage for a specific chat
  * @param {string} chatId - Chat ID
  * @returns {Object} Usage for the chat
@@ -703,14 +705,10 @@ function getCurrentChatId() {
         ?? null;
 }
 
-/** @type {Promise<number>|null} Promise that resolves to input token count - started early, awaited later */
-let pendingInputTokensPromise = null;
-let pendingModelId = null;
-let pendingSourceId = null;
-// For 'continue' type generations, track the pre-continue token count so we can compute the delta
-let preContinueTokenCount = 0;
-/** @type {Promise<number>|null} Promise that resolves to pre-continue token count */
-let pendingPreContinuePromise = null;
+/** Generation type and continue snapshot from the latest GENERATION_STARTED, consumed by GENERATE_AFTER_DATA */
+let pendingGenerationStart = null;
+/** Tracks each generation attempt from request to outcome (succeeded / stopped / failed) */
+const attemptTracker = createAttemptTracker({ onResolve: handleAttemptResolved });
 
 /**
  * Count input tokens from the full prompt context (async helper)
@@ -799,80 +797,38 @@ async function countInputTokens(generate_data) {
 }
 
 /**
- * Handle GENERATE_AFTER_DATA event - start counting input tokens (non-blocking)
- * @param {object} generate_data - The generation data containing the full prompt
- * @param {boolean} dryRun - Whether this is a dry run (token counting only)
- */
-function handleGenerateAfterData(generate_data, dryRun) {
-    // Don't count dry runs - they're just for token estimation, not actual API calls
-    if (dryRun) return;
-
-    // Capture model ID and source ID synchronously (fast)
-    pendingModelId = getCurrentModelId();
-    pendingSourceId = getCurrentSourceId();
-
-    // Start token counting but DON'T await - let it run in parallel with the API request
-    pendingInputTokensPromise = countInputTokens(generate_data)
-        .then(count => {
-            console.log(`[Token Usage Tracker] Input tokens (full context): ${count}, model: ${pendingModelId}, source: ${pendingSourceId}`);
-            return count;
-        })
-        .catch(error => {
-            console.error('[Token Usage Tracker] Error counting input tokens:', error);
-            return 0;
-        });
-}
-
-/**
- * Handle GENERATION_STARTED event - capture pre-continue state
- * This fires before the API call, allowing us to snapshot the current message state
- * for 'continue' type generations so we can calculate the delta later.
+ * Handle GENERATION_STARTED event - remember the generation type and, for 'continue',
+ * snapshot the current message's token count so only the delta is counted later.
  * @param {string} type - Generation type: 'normal', 'continue', 'swipe', 'regenerate', 'quiet', etc.
  * @param {object} params - Generation parameters
  * @param {boolean} isDryRun - Whether this is a dry run
  */
-let isQuietGeneration = false;
-let isImpersonateGeneration = false;
-let pendingQuietOutput = null;
-
 function handleGenerationStarted(type, params, isDryRun) {
     if (isDryRun) return;
 
     // Check if we need to fetch OpenRouter pricing (fire and forget)
     maybeAutoFetchOpenRouterPricing();
 
-    // Track the generation type for special handling
-    isQuietGeneration = (type === 'quiet');
-    isImpersonateGeneration = (type === 'impersonate');
-
-    // Reset pre-continue state
-    preContinueTokenCount = 0;
-
-    // For continue type, capture the current message's token count
-    // Store a promise that will resolve to the pre-continue token count
+    let preContinuePromise = null;
     if (type === 'continue') {
         try {
             const context = getContext();
             const lastMessage = context.chat[context.chat.length - 1];
 
             if (lastMessage) {
-                // Use existing token count if available (synchronous - fast path)
+                // Use existing token count if available (fast path)
                 if (lastMessage.extra?.token_count && typeof lastMessage.extra.token_count === 'number') {
-                    preContinueTokenCount = lastMessage.extra.token_count;
-                    pendingPreContinuePromise = Promise.resolve(lastMessage.extra.token_count);
+                    preContinuePromise = Promise.resolve(lastMessage.extra.token_count);
                 } else {
-                    // Calculate it ourselves - store as a promise so we can await it later
-                    pendingPreContinuePromise = (async () => {
+                    preContinuePromise = (async () => {
                         try {
                             let tokens = await countTokens(lastMessage.mes || '');
                             if (lastMessage.extra?.reasoning) {
                                 tokens += await countTokens(lastMessage.extra.reasoning);
                             }
-                            preContinueTokenCount = tokens;
                             return tokens;
                         } catch (error) {
                             console.error('[Token Usage Tracker] Error calculating pre-continue tokens:', error);
-                            preContinueTokenCount = 0;
                             return 0;
                         }
                     })();
@@ -880,208 +836,245 @@ function handleGenerationStarted(type, params, isDryRun) {
             }
         } catch (error) {
             console.error('[Token Usage Tracker] Error capturing pre-continue state:', error);
-            preContinueTokenCount = 0;
-            pendingPreContinuePromise = Promise.resolve(0);
+            preContinuePromise = Promise.resolve(0);
         }
     }
+
+    pendingGenerationStart = { type, preContinuePromise };
 }
 
 /**
- * Handle message received event - count output tokens and record
- * Uses SillyTavern's pre-calculated token_count when available (includes reasoning)
- * Falls back to manual counting if not available
- *
+ * Handle GENERATE_AFTER_DATA event - begin a generation attempt and start counting
+ * input tokens (non-blocking, runs in parallel with the API request)
+ * @param {object} generate_data - The generation data containing the full prompt
+ * @param {boolean} dryRun - Whether this is a dry run (token counting only)
+ */
+function handleGenerateAfterData(generate_data, dryRun) {
+    // Don't count dry runs - they're just for token estimation, not actual API calls
+    if (dryRun) return;
+
+    const start = pendingGenerationStart;
+    pendingGenerationStart = null;
+    const genType = start?.type || 'normal';
+    const kind = genType === 'quiet' ? 'quiet' : 'main';
+    const modelId = getCurrentModelId();
+    const sourceId = getCurrentSourceId();
+
+    const inputTokensPromise = countInputTokens(generate_data)
+        .then(count => {
+            console.log(`[Token Usage Tracker] Input tokens (full context): ${count}, model: ${modelId}, source: ${sourceId}`);
+            return count;
+        })
+        .catch(error => {
+            console.error('[Token Usage Tracker] Error counting input tokens:', error);
+            return 0;
+        });
+
+    attemptTracker.begin(kind, {
+        genType,
+        modelId,
+        sourceId,
+        // Quiet generations are not attributed to a chat
+        chatId: kind === 'quiet' ? null : getCurrentChatId(),
+        inputTokensPromise,
+        preContinuePromise: start?.preContinuePromise || null,
+    });
+}
+
+/**
+ * Handle message received event - the open main generation succeeded
  * @param {number} messageIndex - Index of the message in the chat array
  * @param {string} type - Type of message event: 'normal', 'swipe', 'continue', 'command', 'first_message', 'extension', etc.
  */
-async function handleMessageReceived(messageIndex, type) {
+function handleMessageReceived(messageIndex, type) {
     // Filter out events that don't correspond to actual API calls
-    // These events are emitted for messages created without calling the API
     const nonApiTypes = ['command', 'first_message'];
     if (nonApiTypes.includes(type)) {
         console.log(`[Token Usage Tracker] Skipping non-API message type: ${type}`);
         return;
     }
 
-    // If there's no pending token counting promise, this likely isn't a real API response
-    // (e.g., could be a late-firing event after chat load)
-    if (!pendingInputTokensPromise) {
-        console.log(`[Token Usage Tracker] Skipping message with no pending token count (type: ${type || 'unknown'})`);
+    // Claim synchronously so the generation-ended check cannot mark it failed
+    const attempt = attemptTracker.openMain();
+    if (!attempt || attempt.meta.genType === 'impersonate') {
+        console.log(`[Token Usage Tracker] Skipping message with no pending generation (type: ${type || 'unknown'})`);
         return;
     }
 
-    try {
-        const context = getContext();
-        const message = context.chat[messageIndex];
-
-        if (!message || !message.mes) return;
-
-        let outputTokens;
-        let reasoningTokens = 0;
-
-        // Count reasoning/thinking tokens separately (from Claude thinking, OpenAI o1, etc.)
-        if (message.extra?.reasoning) {
-            reasoningTokens = await countTokens(message.extra.reasoning);
-            console.log(`[Token Usage Tracker] Counted ${reasoningTokens} reasoning/thinking tokens`);
-        }
-
-        // Use SillyTavern's pre-calculated token count if available
-        // Note: This may include reasoning tokens, so we subtract them to get just response tokens
-        if (message.extra?.token_count && typeof message.extra.token_count === 'number') {
-            outputTokens = message.extra.token_count;
-            // If reasoning tokens exist and are included in token_count, subtract them
-            // We track them separately for more accurate breakdown
-            if (reasoningTokens > 0 && message.extra.token_count > reasoningTokens) {
-                outputTokens = message.extra.token_count - reasoningTokens;
-            }
-            console.log(`[Token Usage Tracker] Token count: ${outputTokens} response + ${reasoningTokens} reasoning`);
-        } else {
-            // Fall back to manual counting (just the message, not reasoning)
-            outputTokens = await countTokens(message.mes);
-            console.log(`[Token Usage Tracker] Manually counted: ${outputTokens} response + ${reasoningTokens} reasoning`);
-        }
-
-        // For 'continue' type, we only want the newly generated tokens, not the full message
-        // Subtract the pre-continue token count to get just the delta
-        // Await the promise to ensure the async calculation has completed
-        if (type === 'continue') {
-            if (pendingPreContinuePromise) {
-                preContinueTokenCount = await pendingPreContinuePromise;
-                pendingPreContinuePromise = null;
-            }
-            if (preContinueTokenCount > 0) {
-                const originalOutputTokens = outputTokens;
-                outputTokens = Math.max(0, outputTokens - preContinueTokenCount);
-                console.log(`[Token Usage Tracker] Continue type: ${originalOutputTokens} total - ${preContinueTokenCount} pre-continue = ${outputTokens} new tokens`);
-            }
-        }
-
-        // Reset pre-continue state
-        const savedPreContinueCount = preContinueTokenCount;
-        preContinueTokenCount = 0;
-        pendingPreContinuePromise = null;
-
-        // Await the input token counting that was started in handleGenerateAfterData
-        const inputTokens = await pendingInputTokensPromise;
-        const modelId = pendingModelId;
-        const sourceId = pendingSourceId;
-        pendingInputTokensPromise = null;
-        pendingModelId = null;
-        pendingSourceId = null;
-
-        const chatId = getCurrentChatId();
-
-        recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId, reasoningTokens);
-
-        console.log(`[Token Usage Tracker] Recorded exchange: ${inputTokens} in, ${outputTokens} out, ${reasoningTokens} reasoning, model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'}${savedPreContinueCount > 0 ? ' (continue delta)' : ''}`);
-    } catch (error) {
-        console.error('[Token Usage Tracker] Error counting output tokens:', error);
-    }
+    const message = getContext().chat?.[messageIndex] || null;
+    attemptTracker.resolve(attempt, 'succeeded', { message, type });
 }
 
 /**
- * Handle generation stopped event - count tokens for cancelled/stopped generations
- * This ensures that input tokens (which were sent to the API) are still counted,
- * along with any partial output tokens that were generated before stopping.
+ * Handle impersonate ready event - the impersonation succeeded
+ * @param {string} text - The generated impersonation text
  */
-async function handleGenerationStopped() {
-    // If there's no pending token counting promise, nothing to record
-    if (!pendingInputTokensPromise) return;
+function handleImpersonateReady(text) {
+    const attempt = attemptTracker.openMain();
+    if (!attempt) return;
+    attemptTracker.resolve(attempt, 'succeeded', { text: typeof text === 'string' ? text : '' });
+}
 
-    try {
-        let outputTokens = 0;
-        let reasoningTokens = 0;
+/**
+ * Handle generation stopped event - count input and any partial output of the stopped generation.
+ * Quiet generations are resolved by their aborted request instead.
+ */
+function handleGenerationStopped() {
+    const attempt = attemptTracker.openMain();
+    if (!attempt) return;
 
-        // Try to get partial output from the streaming processor
-        if (streamingProcessor) {
-            // Count main response text
-            if (streamingProcessor.result) {
-                outputTokens = await countTokens(streamingProcessor.result);
-                console.log(`[Token Usage Tracker] Partial output from stopped generation: ${outputTokens} tokens`);
-            }
+    // Capture partial output now, before the next generation replaces the processor
+    const sp = attempt.meta.streamingProcessor
+        || (streamingProcessor && !streamingProcessor.isStopped ? streamingProcessor : null);
+    attemptTracker.resolve(attempt, 'stopped', {
+        text: sp?.result || '',
+        reasoning: sp?.reasoningHandler?.reasoning || '',
+    });
+}
 
-            // Also count any reasoning tokens that were generated (tracked separately)
-            if (streamingProcessor.reasoningHandler?.reasoning) {
-                reasoningTokens = await countTokens(streamingProcessor.reasoningHandler.reasoning);
-                console.log(`[Token Usage Tracker] Including ${reasoningTokens} partial reasoning tokens`);
-            }
-        }
-
-        // Await the input token counting that was started in handleGenerateAfterData
-        const inputTokens = await pendingInputTokensPromise;
-        const modelId = pendingModelId;
-        const sourceId = pendingSourceId;
-        pendingInputTokensPromise = null;
-        pendingModelId = null;
-        pendingSourceId = null;
-        preContinueTokenCount = 0; // Reset continue state too
-
-        const chatId = getCurrentChatId();
-
-        // Record the usage - input tokens were sent even if generation was stopped
-        recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId, reasoningTokens);
-
-        console.log(`[Token Usage Tracker] Recorded stopped generation: ${inputTokens} in, ${outputTokens} out, ${reasoningTokens} reasoning (partial), model: ${modelId || 'unknown'}, source: ${sourceId || 'unknown'}`);
-    } catch (error) {
-        console.error('[Token Usage Tracker] Error handling stopped generation:', error);
-        // Reset pending tokens even on error to prevent double counting
-        pendingInputTokensPromise = null;
-        preContinueTokenCount = 0;
+/**
+ * Handle generation ended event (fires when the stop button hides: on success, error and stop)
+ */
+function handleGenerationEnded() {
+    const attempt = attemptTracker.openMain();
+    // A live, non-errored processor means this generation streamed even if its request did not say so.
+    // (SillyTavern clears the processor after every stream except one that errored.)
+    if (attempt && !attempt.meta.streamingProcessor && streamingProcessor && !streamingProcessor.isStopped) {
+        attempt.meta.streamingProcessor = streamingProcessor;
+        attemptTracker.markStreaming(attempt);
     }
+    const sp = attempt?.meta.streamingProcessor;
+    // onErrorStreaming sets isStopped; a user stop sets isFinished instead
+    const streamError = Boolean(sp && sp.isStopped === true && sp.isFinished !== true);
+    attemptTracker.generationEnded({ streamError });
 }
 
 /**
  * Handle chat changed event
  */
 function handleChatChanged(chatId) {
-    // Reset pending tokens when chat changes to prevent cross-chat counting
-    pendingInputTokensPromise = null;
-    pendingModelId = null;
-    pendingSourceId = null;
-    preContinueTokenCount = 0;
-    isQuietGeneration = false;
-    isImpersonateGeneration = false;
+    // Open attempts are kept: they are real requests and carry their own chat ID
     console.log(`[Token Usage Tracker] Chat changed to: ${chatId}`);
     eventSource.emit('tokenUsageUpdated', getUsageStats());
 }
 
 /**
- * Handle impersonate ready event - count output tokens for impersonation
- * This fires when impersonation completes and puts text into the input field
- * @param {string} text - The generated impersonation text
+ * Record a resolved generation attempt (called synchronously by the attempt tracker)
+ * @param {object} attempt
+ * @param {'succeeded'|'stopped'|'failed'} status
+ * @param {object} details
  */
-async function handleImpersonateReady(text) {
-    if (!pendingInputTokensPromise) return;
+function handleAttemptResolved(attempt, status, details) {
+    attempt.recording = recordAttempt(attempt, status, details).catch(error => {
+        console.error('[Token Usage Tracker] Error recording generation:', error);
+        recordHealthError(error?.message || String(error));
+    });
+}
 
-    try {
+/**
+ * Count tokens for a resolved attempt and record it
+ * @param {object} attempt
+ * @param {'succeeded'|'stopped'|'failed'} status
+ * @param {object} details - { message } | { text, reasoning } | { responseData } | {}
+ */
+async function recordAttempt(attempt, status, details) {
+    const { chatId, modelId, sourceId } = attempt.meta;
 
-        // Await the input token counting that was started in handleGenerateAfterData
-        const inputTokens = await pendingInputTokensPromise;
-        const modelId = pendingModelId;
-        const sourceId = pendingSourceId;
-        pendingInputTokensPromise = null;
-        pendingModelId = null;
-        pendingSourceId = null;
+    if (status === 'failed') {
+        recordFailedAttempt(chatId, modelId, sourceId);
+        return;
+    }
 
-        // Count output tokens from the impersonated text
-        let outputTokens = 0;
-        if (text && typeof text === 'string') {
-            outputTokens = await countTokens(text);
+    let outputTokens = 0;
+    let reasoningTokens = 0;
+
+    if (details.message) {
+        ({ outputTokens, reasoningTokens } = await countMessageOutput(details.message, attempt));
+    } else {
+        let text = details.text || '';
+        let reasoning = details.reasoning || '';
+        if (details.responseData) {
+            text = extractResponseText(details.responseData);
+            reasoning = await extractResponseReasoning(details.responseData);
         }
+        if (text) outputTokens = await countTokens(text);
+        if (reasoning) reasoningTokens = await countTokens(reasoning);
+    }
 
-        const chatId = getCurrentChatId();
+    const inputTokens = (await attempt.meta.inputTokensPromise) || 0;
+    recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId, reasoningTokens, status === 'stopped' ? 'stopped' : 'succeeded');
+}
 
-        recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId);
+/**
+ * Count output tokens of a received chat message.
+ * Uses SillyTavern's pre-calculated token_count when available (includes reasoning),
+ * falling back to manual counting.
+ * @param {object} message - Chat message
+ * @param {object} attempt - The generation attempt that produced it
+ * @returns {Promise<{outputTokens: number, reasoningTokens: number}>}
+ */
+async function countMessageOutput(message, attempt) {
+    let outputTokens;
+    let reasoningTokens = 0;
 
+    // Count reasoning/thinking tokens separately (from Claude thinking, OpenAI o1, etc.)
+    if (message.extra?.reasoning) {
+        reasoningTokens = await countTokens(message.extra.reasoning);
+    }
 
-        // Reset impersonate state
-        isImpersonateGeneration = false;
-    } catch (error) {
-        console.error('[Token Usage Tracker] Error handling impersonate ready:', error);
-        pendingInputTokensPromise = null;
-        pendingModelId = null;
-        pendingSourceId = null;
-        isImpersonateGeneration = false;
+    // token_count may include reasoning tokens, so subtract them to get just response tokens
+    if (message.extra?.token_count && typeof message.extra.token_count === 'number') {
+        outputTokens = message.extra.token_count;
+        if (reasoningTokens > 0 && message.extra.token_count > reasoningTokens) {
+            outputTokens = message.extra.token_count - reasoningTokens;
+        }
+    } else {
+        outputTokens = await countTokens(message.mes || '');
+    }
+
+    // For 'continue', only count the newly generated tokens
+    if (attempt.meta.genType === 'continue' && attempt.meta.preContinuePromise) {
+        const preContinueTokenCount = await attempt.meta.preContinuePromise;
+        if (preContinueTokenCount > 0) {
+            const fullOutputTokens = outputTokens;
+            outputTokens = Math.max(0, outputTokens - preContinueTokenCount);
+            console.log(`[Token Usage Tracker] Continue type: ${fullOutputTokens} total - ${preContinueTokenCount} pre-continue = ${outputTokens} new tokens`);
+        }
+    }
+
+    return { outputTokens, reasoningTokens };
+}
+
+/**
+ * Extract the generated text from a non-streaming API response
+ * @param {object} data - Response JSON
+ * @returns {string}
+ */
+function extractResponseText(data) {
+    try {
+        const text = stScript.extractMessageFromData?.(data);
+        return typeof text === 'string' ? text : '';
+    } catch {
+        return '';
+    }
+}
+
+/** @type {Promise<object|null>|null} */
+let reasoningModulePromise = null;
+
+/**
+ * Extract reasoning from a non-streaming API response (best effort)
+ * @param {object} data - Response JSON
+ * @returns {Promise<string>}
+ */
+async function extractResponseReasoning(data) {
+    reasoningModulePromise ??= import('../../../reasoning.js').catch(() => null);
+    const reasoningModule = await reasoningModulePromise;
+    try {
+        const reasoning = reasoningModule?.extractReasoningFromData?.(data, { ignoreShowThoughts: true });
+        return typeof reasoning === 'string' ? reasoning : '';
+    } catch {
+        return '';
     }
 }
 
@@ -1152,13 +1145,24 @@ function registerSlashCommands() {
         callback: async () => {
             const stats = getUsageStats();
             const efficiency = calculateEfficiencyMetrics(stats.today);
+            const now = getCurrentEasternTime();
+            const tracking = getOutcomeTrackingKeys();
+            const today = generationStats(stats.today);
+            const hour = generationStats(stats.thisHour);
+            const todayComplete = hasCompleteOutcomes(getDayKey(now), tracking.day);
+            const hourComplete = hasCompleteOutcomes(getHourKey(now), tracking.hour);
+            const trackingNote = !todayComplete && tracking.since ? ` (tracking began ${_fmtHourFull.format(tracking.since)})` : '';
             return [
                 `**Today's Token Usage:**`,
                 `Total: ${formatNumberFull(stats.today.total)} tokens`,
                 `Input: ${formatNumberFull(stats.today.input || 0)} tokens`,
                 `Output: ${formatNumberFull(stats.today.output || 0)} tokens`,
-                `Messages: ${stats.today.messageCount || 0}`,
-                `Efficiency: ${efficiency.ratio.toFixed(2)}× out/in, ${formatTokens(efficiency.perMessage)}/msg`,
+                `Generations: ${formatNumberFull(today.generations)}`,
+                `Stopped: ${formatNumberFull(today.stopped)}`,
+                `Failed: ${formatNumberFull(today.failed)}`,
+                `Success rate: ${formatSuccessRate(today, todayComplete)}${trackingNote}`,
+                `This hour: ${hour.generations} generations, ${hour.stopped} stopped, ${hour.failed} failed, ${formatSuccessRate(hour, hourComplete)} success`,
+                `Efficiency: ${efficiency.ratio.toFixed(2)}× out/in, ${formatTokens(efficiency.perMessage)}/gen`,
             ].join('\n');
         },
         returns: "Today's token usage",
@@ -1183,8 +1187,9 @@ function registerSlashCommands() {
                 `Total: ${formatNumberFull(chatUsage.total)} tokens`,
                 `Input: ${formatNumberFull(chatUsage.input)} tokens`,
                 `Output: ${formatNumberFull(chatUsage.output)} tokens`,
-                `Messages: ${chatUsage.messageCount}`,
-                `Efficiency: ${efficiency.ratio.toFixed(2)}× out/in, ${formatTokens(efficiency.perMessage)}/msg`,
+                `Generations: ${formatNumberFull(chatUsage.messageCount || 0)}`,
+                `Stopped: ${formatNumberFull(chatUsage.stopped || 0)} · Failed: ${formatNumberFull(chatUsage.failed || 0)}`,
+                `Efficiency: ${efficiency.ratio.toFixed(2)}× out/in, ${formatTokens(efficiency.perMessage)}/gen`,
             ].join('\n');
         },
         returns: 'Current chat token usage',
@@ -1261,6 +1266,7 @@ window['TokenUsageTracker'] = {
     resetSession,
     resetAllUsage,
     recordUsage,
+    recordFailedAttempt,
     countTokens, // Expose the token counting function
     getCurrentModelId,
     getCurrentSourceId,
@@ -1282,6 +1288,13 @@ function formatTokens(count) {
     if (count >= 1000000) return (count / 1000000).toFixed(1) + 'M';
     if (count >= 1000) return (count / 1000).toFixed(1) + 'K';
     return count.toString();
+}
+
+/**
+ * Format a count: exact below 10,000, abbreviated above
+ */
+function formatCount(count) {
+    return count >= 10000 ? formatTokens(count) : formatNumberFull(count);
 }
 
 /**
@@ -1630,6 +1643,7 @@ let currentChartRange = 30;
 let currentSourceFilter = 'all'; // 'all' or specific source ID like 'openai', 'textgenerationwebui'
 let currentChartType = 'bar'; // 'bar' or 'line'
 let currentGranularity = 'daily'; // 'daily' or 'hourly'
+let currentChartMetric = 'tokens'; // 'tokens' or 'generations'
 let chartData = [];
 let tooltip = null;
 
@@ -1746,6 +1760,7 @@ function getChartData(days, sourceFilter = 'all') {
     const data = [];
     const today = getCurrentEasternTime();
     const { year, month, day } = getEasternParts(today);
+    const trackingDayKey = getOutcomeTrackingKeys().day;
 
     for (let i = days - 1; i >= 0; i--) {
         const date = new Date(year, month - 1, day - i, 12, 0, 0);
@@ -1774,13 +1789,18 @@ function getChartData(days, sourceFilter = 'all') {
             models = dayData.models || {};
         }
 
+        const generation = generationPoint(dayData, sourceFilter);
+
         data.push({
             date: date,
             dayKey: dayKey,
-            usage: usage,
+            usage: currentChartMetric === 'generations' ? generation.generations : usage,
+            tokensTotal: usage,
             input: input,
             output: output,
             models: models,
+            generation: generation,
+            outcomesComplete: hasCompleteOutcomes(dayKey, trackingDayKey),
             displayDate: _fmtDayDisplay.format(date),
             fullDate: _fmtDayFull.format(date)
         });
@@ -1798,6 +1818,7 @@ function getHourlyChartData(hours, sourceFilter = 'all') {
     const byHour = settings.usage.byHour || {};
     const data = [];
     const now = getCurrentEasternTime();
+    const trackingHourKey = getOutcomeTrackingKeys().hour;
 
     for (let i = hours - 1; i >= 0; i--) {
         const date = new Date(now.getTime() - i * 60 * 60 * 1000);
@@ -1824,13 +1845,18 @@ function getHourlyChartData(hours, sourceFilter = 'all') {
             models = hourData.models || {};
         }
 
+        const generation = generationPoint(hourData, sourceFilter);
+
         data.push({
             date: date,
             hourKey: hourKey,
-            usage: usage,
+            usage: currentChartMetric === 'generations' ? generation.generations : usage,
+            tokensTotal: usage,
             input: input,
             output: output,
             models: models,
+            generation: generation,
+            outcomesComplete: hasCompleteOutcomes(hourKey, trackingHourKey),
             displayDate: _fmtHourDisplay.format(date),
             fullDate: _fmtHourFull.format(date)
         });
@@ -1861,7 +1887,15 @@ function getRangeTotals(rangeDays, sourceFilter = 'all') {
     const byDay = settings.usage.byDay || {};
     const now = getCurrentEasternTime();
     const { year, month, day } = getEasternParts(now);
-    const totals = { input: 0, output: 0, reasoning: 0, total: 0, cost: 0 };
+    const totals = { input: 0, output: 0, reasoning: 0, total: 0, cost: 0, messageCount: 0, stopped: 0, failed: 0 };
+    const firstDayKey = getDayKey(new Date(year, month - 1, day - (rangeDays - 1), 12, 0, 0));
+    totals.outcomesComplete = hasCompleteOutcomes(firstDayKey, getOutcomeTrackingKeys().day);
+
+    const addCounts = (entry) => {
+        totals.messageCount += entry.messageCount || 0;
+        totals.stopped += entry.stopped || 0;
+        totals.failed += entry.failed || 0;
+    };
 
     for (let i = 0; i < rangeDays; i++) {
         const date = new Date(year, month - 1, day - i, 12, 0, 0);
@@ -1872,6 +1906,7 @@ function getRangeTotals(rangeDays, sourceFilter = 'all') {
         if (sourceFilter !== 'all') {
             const sourceData = dayData.sources ? dayData.sources[sourceFilter] : null;
             if (!sourceData) continue;
+            addCounts(sourceData);
             totals.input += sourceData.input || 0;
             totals.output += sourceData.output || 0;
             totals.total += sourceData.total || 0;
@@ -1886,6 +1921,7 @@ function getRangeTotals(rangeDays, sourceFilter = 'all') {
             continue;
         }
 
+        addCounts(dayData);
         totals.input += dayData.input || 0;
         totals.output += dayData.output || 0;
         totals.reasoning += dayData.reasoning || 0;
@@ -1909,6 +1945,24 @@ function getRangeTotals(rangeDays, sourceFilter = 'all') {
 function updateRangeSummary() {
     const totals = getRangeTotals(currentChartRange, currentSourceFilter);
     const label = currentChartRange === 1 ? 'today' : `last ${currentChartRange} days`;
+    const isGenerations = currentChartMetric === 'generations';
+
+    $('#token-usage-summary-tokens').toggle(!isGenerations);
+    $('#token-usage-summary-generations').toggle(isGenerations);
+    $('#token-usage-chart-note').toggle(isGenerations && currentSourceFilter !== 'all');
+
+    if (isGenerations) {
+        const stats = generationStats(totals);
+        const rate = formatSuccessRate(stats, totals.outcomesComplete);
+        $('#token-usage-today-total').text(formatNumberFull(stats.generations));
+        $('#token-usage-today-cost').text(rate === '—' ? '' : `${rate} success`);
+        $('#token-usage-range-label').text(currentChartRange === 1 ? 'generations today' : `generations, last ${currentChartRange} days`);
+        $('#token-usage-summary-stopped').text(formatNumberFull(stats.stopped));
+        $('#token-usage-summary-failed').text(formatNumberFull(stats.failed));
+        $('#token-usage-summary-attempts-wrap').toggle(totals.outcomesComplete);
+        $('#token-usage-summary-attempts').text(formatNumberFull(stats.attempts));
+        return;
+    }
 
     $('#token-usage-today-total').text(formatTokens(totals.total));
     $('#token-usage-today-in').text(formatTokens(totals.input || 0));
@@ -1916,6 +1970,34 @@ function updateRangeSummary() {
     $('#token-usage-today-reasoning').text(formatTokens(totals.reasoning || 0));
     $('#token-usage-today-cost').text(`$${totals.cost.toFixed(2)}`);
     $('#token-usage-range-label').text(label);
+}
+
+/**
+ * Stacked bar segments for a chart point, bottom first
+ * @param {object} d - Chart point
+ * @returns {{value: number, color: string, opacity: string}[]}
+ */
+function getBarSegments(d) {
+    if (currentChartMetric === 'generations') {
+        const modelEntries = Object.entries(d.generation?.modelCounts || {}).sort((a, b) => b[1] - a[1]);
+        const attributed = modelEntries.reduce((sum, [, count]) => sum + count, 0);
+        const segments = [];
+        // Generations recorded before per-model counts existed share one neutral segment
+        if (d.usage > attributed) {
+            segments.push({ value: d.usage - attributed, color: 'var(--SmartThemeBodyColor)', opacity: '0.25' });
+        }
+        for (const [modelId, count] of modelEntries) {
+            segments.push({ value: count, color: getModelColor(modelId), opacity: '1' });
+        }
+        return segments;
+    }
+
+    if (!d.models || Object.keys(d.models).length === 0) return [];
+    // Extract total from new object format or use number directly for legacy
+    const getTokens = (v) => typeof v === 'number' ? v : (v.total || 0);
+    return Object.entries(d.models)
+        .sort((a, b) => getTokens(b[1]) - getTokens(a[1])) // Sort by usage desc
+        .map(([modelId, modelData]) => ({ value: getTokens(modelData), color: getModelColor(modelId), opacity: '1' }));
 }
 
 /**
@@ -1959,18 +2041,25 @@ function renderChart() {
     svg.appendChild(textGroup);
 
     // Y Scale
-    const maxUsage = Math.max(...chartData.map(d => d.usage), 1);
-    const roughStep = maxUsage / 4;
-    const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep || 1)));
-    let step = Math.ceil(roughStep / magnitude) * magnitude || 1000;
+    const isGenerations = currentChartMetric === 'generations';
+    let step;
+    let niceMax;
+    if (isGenerations) {
+        ({ step, niceMax } = countAxisScale(Math.max(...chartData.map(d => d.usage), 0)));
+    } else {
+        const maxUsage = Math.max(...chartData.map(d => d.usage), 1);
+        const roughStep = maxUsage / 4;
+        const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep || 1)));
+        step = Math.ceil(roughStep / magnitude) * magnitude || 1000;
 
-    if (step / magnitude < 1.5) step = 1 * magnitude;
-    else if (step / magnitude < 3) step = 2.5 * magnitude;
-    else if (step / magnitude < 7) step = 5 * magnitude;
-    else step = 10 * magnitude;
+        if (step / magnitude < 1.5) step = 1 * magnitude;
+        else if (step / magnitude < 3) step = 2.5 * magnitude;
+        else if (step / magnitude < 7) step = 5 * magnitude;
+        else step = 10 * magnitude;
 
-    let niceMax = Math.ceil(maxUsage / step) * step;
-    if (niceMax === 0) niceMax = 5000;
+        niceMax = Math.ceil(maxUsage / step) * step;
+        if (niceMax === 0) niceMax = 5000;
+    }
 
     const yScale = (val) => chartHeight - (val / niceMax) * chartHeight;
 
@@ -1997,7 +2086,7 @@ function renderChart() {
             'font-size': '10',
             'font-family': 'ui-sans-serif, system-ui, sans-serif'
         });
-        text.textContent = formatTokens(val);
+        text.textContent = isGenerations ? formatCount(val) : formatTokens(val);
         textGroup.appendChild(text);
     }
 
@@ -2055,16 +2144,12 @@ function renderChart() {
         }
 
         // Draw filled segments for each model
-        if (d.models && Object.keys(d.models).length > 0 && d.usage > 0) {
-            // Extract total from new object format or use number directly for legacy
-            const getTokens = (v) => typeof v === 'number' ? v : (v.total || 0);
-            const modelEntries = Object.entries(d.models).sort((a, b) => getTokens(b[1]) - getTokens(a[1])); // Sort by usage desc
-
+        const segments = getBarSegments(d);
+        if (segments.length > 0 && d.usage > 0) {
             let cumulativeY = barY + h; // Start from bottom
 
-            for (const [modelId, modelData] of modelEntries) {
-                const tokens = getTokens(modelData);
-                const segmentHeight = (tokens / d.usage) * h;
+            for (const { value, color, opacity } of segments) {
+                const segmentHeight = (value / d.usage) * h;
                 const segmentY = cumulativeY - segmentHeight;
 
                 // Create path for this segment with rounded corners for top segment
@@ -2086,11 +2171,10 @@ function renderChart() {
                     segmentPath = `M ${barX},${cumulativeY} v-${segmentHeight} h${w} v${segmentHeight} z`;
                 }
 
-                const color = getModelColor(modelId);
                 const segment = createSVGElement('path', {
                     d: segmentPath,
                     fill: color,
-                    opacity: '1',
+                    opacity: opacity,
                     'shape-rendering': 'geometricPrecision',
                     'pointer-events': 'none'
                 });
@@ -2176,18 +2260,25 @@ function renderLineChart() {
     svg.appendChild(textGroup);
 
     // Y Scale
-    const maxUsage = Math.max(...chartData.map(d => d.usage), 1);
-    const roughStep = maxUsage / 4;
-    const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep || 1)));
-    let step = Math.ceil(roughStep / magnitude) * magnitude || 1000;
+    const isGenerations = currentChartMetric === 'generations';
+    let step;
+    let niceMax;
+    if (isGenerations) {
+        ({ step, niceMax } = countAxisScale(Math.max(...chartData.map(d => d.usage), 0)));
+    } else {
+        const maxUsage = Math.max(...chartData.map(d => d.usage), 1);
+        const roughStep = maxUsage / 4;
+        const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep || 1)));
+        step = Math.ceil(roughStep / magnitude) * magnitude || 1000;
 
-    if (step / magnitude < 1.5) step = 1 * magnitude;
-    else if (step / magnitude < 3) step = 2.5 * magnitude;
-    else if (step / magnitude < 7) step = 5 * magnitude;
-    else step = 10 * magnitude;
+        if (step / magnitude < 1.5) step = 1 * magnitude;
+        else if (step / magnitude < 3) step = 2.5 * magnitude;
+        else if (step / magnitude < 7) step = 5 * magnitude;
+        else step = 10 * magnitude;
 
-    let niceMax = Math.ceil(maxUsage / step) * step;
-    if (niceMax === 0) niceMax = 5000;
+        niceMax = Math.ceil(maxUsage / step) * step;
+        if (niceMax === 0) niceMax = 5000;
+    }
 
     const yScale = (val) => chartHeight - (val / niceMax) * chartHeight;
     const xScale = (i) => margin.left + (i / (chartData.length - 1 || 1)) * chartWidth;
@@ -2215,7 +2306,7 @@ function renderLineChart() {
             'font-size': '10',
             'font-family': 'ui-sans-serif, system-ui, sans-serif'
         });
-        text.textContent = formatTokens(val);
+        text.textContent = isGenerations ? formatCount(val) : formatTokens(val);
         textGroup.appendChild(text);
     }
 
@@ -2323,6 +2414,11 @@ function renderChartByType() {
 function showTooltip(d) {
     if (!tooltip) return;
 
+    if (currentChartMetric === 'generations') {
+        showGenerationTooltip(d);
+        return;
+    }
+
     // Calculate total cost for this timeframe
     let totalCost = 0;
     let modelCosts = {};
@@ -2384,6 +2480,50 @@ function showTooltip(d) {
         <div style="color: var(--SmartThemeBodyColor);">${formatNumberFull(d.usage)} tokens</div>
         <div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.6;">${formatNumberFull(d.input)} in / ${formatNumberFull(d.output)} out</div>
         ${costLine}
+        ${modelBreakdown}
+    `;
+    tooltip.style.display = 'block';
+}
+
+/**
+ * Tooltip content for the Generations chart metric
+ * @param {object} d - Chart point
+ */
+function showGenerationTooltip(d) {
+    const stats = d.generation || generationStats();
+    let outcomeLine = '';
+    if (d.outcomesComplete && stats.attempts > 0) {
+        outcomeLine = `${stats.stopped} stopped · ${stats.failed} failed · ${formatSuccessRate(stats, true)} success`;
+    } else if (stats.stopped > 0 || stats.failed > 0) {
+        outcomeLine = `${stats.stopped} stopped · ${stats.failed} failed`;
+    }
+
+    let modelBreakdown = '';
+    const modelEntries = Object.entries(stats.modelCounts || {}).sort((a, b) => a[1] - b[1]); // Ascending, like the bars bottom-up
+    if (modelEntries.length > 0) {
+        modelBreakdown = '<div style="margin-top: 4px; padding-top: 4px; border-top: 1px solid rgba(255,255,255,0.2);">';
+        for (const [model, count] of modelEntries.slice(-8)) {
+            const percent = d.usage > 0 ? Math.round((count / d.usage) * 100) : 0;
+            const shortName = escapeHtml(model.length > 25 ? model.substring(0, 22) + '...' : model);
+            modelBreakdown += `<div style="font-size: 9px; color: rgba(255,255,255,0.5); display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 4px; min-width: 0;">
+                    <span style="display: inline-block; width: 8px; height: 8px; background: ${getModelColor(model)}; border-radius: 2px; flex-shrink: 0;"></span>
+                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${shortName}</span>
+                </div>
+                <span style="flex-shrink: 0;">${formatNumberFull(count)} (${percent}%)</span>
+            </div>`;
+        }
+        if (modelEntries.length > 8) {
+            modelBreakdown += `<div style="font-size: 9px; color: rgba(255,255,255,0.3);">+${modelEntries.length - 8} more</div>`;
+        }
+        modelBreakdown += '</div>';
+    }
+
+    tooltip.innerHTML = `
+        <div style="font-weight: 600; margin-bottom: 2px; color: var(--SmartThemeBodyColor);">${d.fullDate}</div>
+        <div style="color: var(--SmartThemeBodyColor);">${formatNumberFull(d.usage)} generation${d.usage === 1 ? '' : 's'}</div>
+        <div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.6;">${formatNumberFull(d.tokensTotal || 0)} tokens</div>
+        ${outcomeLine ? `<div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.8;">${outcomeLine}</div>` : ''}
         ${modelBreakdown}
     `;
     tooltip.style.display = 'block';
@@ -2755,7 +2895,7 @@ function createMiniview() {
                     <span class="miniview-stat-value" id="miniview-reasoning">0</span>
                 </div>
                 <div class="miniview-stat-row miniview-stat-secondary">
-                    <span class="miniview-stat-label">Messages</span>
+                    <span class="miniview-stat-label">Generations</span>
                     <span class="miniview-stat-value" id="miniview-messages">0</span>
                 </div>
                 <div class="miniview-stat-row miniview-stat-cost">
@@ -3612,10 +3752,15 @@ function createSettingsUI() {
                                 <span id="token-usage-today-cost" style="font-size: 12px; color: var(--SmartThemeBodyColor); opacity: 0.8;">$0.00</span>
                                 <span id="token-usage-range-label" style="font-size: 11px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> today</span>
                             </div>
-                            <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;">
+                            <div id="token-usage-summary-tokens" style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;">
                                 <span id="token-usage-today-in">${formatTokens(stats.today.input || 0)}</span> in /
                                 <span id="token-usage-today-out">${formatTokens(stats.today.output || 0)}</span> out /
                                 <span id="token-usage-today-reasoning">${formatTokens(stats.today.reasoning || 0)}</span> 🧠
+                            </div>
+                            <div id="token-usage-summary-generations" style="display: none; font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;">
+                                <span id="token-usage-summary-stopped">0</span> stopped /
+                                <span id="token-usage-summary-failed">0</span> failed<span id="token-usage-summary-attempts-wrap"> /
+                                <span id="token-usage-summary-attempts">0</span> attempts</span>
                             </div>
                         </div>
                         <div style="display: flex; align-items: center; gap: 6px;">
@@ -3632,7 +3777,11 @@ function createSettingsUI() {
                     </div>
 
                     <!-- Chart Options -->
-                    <div style="display: flex; justify-content: flex-end; gap: 6px; margin-bottom: 6px;">
+                    <div style="display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-bottom: 6px;">
+                        <div style="display: inline-flex; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; padding: 2px;">
+                            <button class="token-usage-metric-btn menu_button active" data-value="tokens" style="padding: 3px 8px; font-size: 10px; border-radius: 4px;">Tokens</button>
+                            <button class="token-usage-metric-btn menu_button" data-value="generations" style="padding: 3px 8px; font-size: 10px; border-radius: 4px;">Generations</button>
+                        </div>
                         <div style="display: inline-flex; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; padding: 2px;">
                             <button class="token-usage-granularity-btn menu_button active" data-value="daily" style="padding: 3px 8px; font-size: 10px; border-radius: 4px;">Daily</button>
                             <button class="token-usage-granularity-btn menu_button" data-value="hourly" style="padding: 3px 8px; font-size: 10px; border-radius: 4px;">Hourly</button>
@@ -3645,6 +3794,7 @@ function createSettingsUI() {
 
                     <!-- Chart -->
                     <div id="token-usage-chart" style="width: 100%; height: 320px; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; overflow: hidden; margin-bottom: 12px;"></div>
+                    <div id="token-usage-chart-note" style="display: none; margin: -8px 0 10px; font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Per-source generation counts are only recorded from this version onward; earlier days show 0.</div>
 
                     <!-- Stats Grid (Week, Month, All Time) -->
                     <div class="token-usage-stats-grid" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 10px;">
@@ -3691,7 +3841,7 @@ function createSettingsUI() {
                                 </div>
                                 <div>
                                     <span style="font-size: 13px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-efficiency-permsg">0</span>
-                                    <span style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> /msg</span>
+                                    <span style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> /gen</span>
                                 </div>
                             </div>
                         </div>
@@ -3704,7 +3854,7 @@ function createSettingsUI() {
                                 </div>
                                 <div>
                                     <span style="font-size: 13px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-efficiency-alltime-permsg">0</span>
-                                    <span style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> /msg</span>
+                                    <span style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;"> /gen</span>
                                 </div>
                             </div>
                         </div>
@@ -3724,7 +3874,7 @@ function createSettingsUI() {
                                         <div style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-chat-total">0</div>
                                     </div>
                                     <div>
-                                        <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Messages</div>
+                                        <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Generations</div>
                                         <div style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-chat-messages">0</div>
                                     </div>
                                     <div>
@@ -3832,6 +3982,18 @@ function createSettingsUI() {
     document.querySelectorAll('.token-usage-range-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             updateChartRange(parseInt(btn.getAttribute('data-value')));
+        });
+    });
+
+    // Chart metric button handlers
+    document.querySelectorAll('.token-usage-metric-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            currentChartMetric = btn.getAttribute('data-value');
+            document.querySelectorAll('.token-usage-metric-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            chartData = getChartDataForGranularity();
+            renderChartByType();
+            updateRangeSummary();
         });
     });
 
@@ -3946,102 +4108,153 @@ function createSettingsUI() {
 
 /**
  * Set up tracking for background generations:
- * - Quiet generations (Summarize, Expressions, etc.) via event listeners
+ * - Generation requests (including quiet ones: Summarize, Expressions, etc.) via a fetch observer
  * - ConnectionManagerRequestService.sendRequest (Roadway, Scratch Pad, etc.) via function wrapping
  */
-let isTrackingBackground = false;
 let resizeAbortController = null;
 let resizeBusUnsubscribe = null;
 
 function patchBackgroundGenerations() {
-    registerQuietGenerationListeners();
+    installGenerationRequestObserver();
     patchConnectionManager();
 }
 
-function registerQuietGenerationListeners() {
-    // For quiet generations (Guided Generations, Summarize, Expressions, etc.),
-    // MESSAGE_RECEIVED doesn't fire. Flush pending tokens on next generation or chat change.
-    // IMPORTANT: These handlers must be non-blocking to avoid freezing the UI
-    eventSource.on(event_types.GENERATION_STARTED, (type, params, dryRun) => {
-        if (dryRun) return;
-        if (isQuietGeneration && pendingInputTokensPromise) {
-            // Schedule flush but don't await - prevents blocking the generation
-            flushQuietGeneration().catch(e => {
-                console.error('[Token Usage Tracker] Error flushing quiet generation:', e);
-            });
-        }
-    });
-
-    eventSource.on(event_types.CHAT_CHANGED, () => {
-        if (isQuietGeneration && pendingInputTokensPromise) {
-            // Schedule flush but don't await - prevents blocking UI
-            flushQuietGeneration().catch(e => {
-                console.error('[Token Usage Tracker] Error flushing quiet generation on chat change:', e);
-            });
-        }
-    });
-
-    // Eagerly capture streamingProcessor.result when a quiet generation stops,
-    // before the reference can be overwritten by a subsequent generation.
-    eventSource.on(event_types.GENERATION_STOPPED, () => {
-        if (isQuietGeneration && pendingInputTokensPromise && streamingProcessor?.result) {
-            pendingQuietOutput = streamingProcessor.result;
-        }
-    });
-}
-
 /**
- * Flush a pending quiet generation, recording tokens from what we have
- */
-async function flushQuietGeneration() {
-    if (!pendingInputTokensPromise) return;
-
-    // Capture output synchronously before any await, so we read the correct
-    // streamingProcessor state (it may be overwritten by the next generation).
-    const capturedOutput = pendingQuietOutput || streamingProcessor?.result || null;
-    pendingQuietOutput = null;
-
-    try {
-        const inputTokens = await pendingInputTokensPromise;
-        const modelId = pendingModelId;
-        const sourceId = pendingSourceId;
-
-        // Count output tokens from the captured result
-        let outputTokens = 0;
-        if (capturedOutput) {
-            outputTokens = await countTokens(capturedOutput);
-        }
-
-        // Record the usage
-        if (inputTokens > 0 || outputTokens > 0) {
-            recordUsage(inputTokens, outputTokens, null, modelId, sourceId);
-        }
-    } catch (e) {
-        console.error('[Token Usage Tracker] Error flushing quiet generation:', e);
-    } finally {
-        // Reset state
-        pendingInputTokensPromise = null;
-        pendingModelId = null;
-        pendingSourceId = null;
-        isQuietGeneration = false;
-    }
-}
-
-/**
- * Flush pending quiet usage immediately, optionally with caller-provided output text.
- * Returns false when no quiet usage is pending.
+ * Record the oldest open quiet generation now, optionally with caller-provided output text.
+ * Returns false when no quiet generation is pending (it was already recorded).
  * @param {string} [outputText]
  * @returns {Promise<boolean>}
  */
 async function flushPendingQuietGeneration(outputText = '') {
-    if (!isQuietGeneration || !pendingInputTokensPromise) return false;
+    const attempt = attemptTracker.oldestOpen('quiet');
+    if (!attempt) return false;
 
-    if (typeof outputText === 'string' && outputText.length > 0) {
-        pendingQuietOutput = outputText;
+    attemptTracker.resolve(attempt, 'succeeded', { text: typeof outputText === 'string' ? outputText : '' });
+    await attempt.recording;
+    return true;
+}
+
+/** SillyTavern backend endpoints that perform one text generation request */
+const GENERATION_REQUEST_PATHS = new Set([
+    '/api/backends/chat-completions/generate',
+    '/api/backends/text-completions/generate',
+    '/api/backends/kobold/generate',
+    '/api/backends/koboldhorde/generate',
+    '/api/novelai/generate',
+    '/api/horde/generate-text',
+]);
+
+/** Unique symbol to mark fetch as observed by this extension. */
+const TOKEN_USAGE_FETCH_PATCHED = Symbol.for('tokenUsageTrackerFetchPatched');
+
+/**
+ * Observe generation requests to learn whether each attempt reached the API and how it ended.
+ * The request itself and the caller's Response are never modified.
+ */
+function installGenerationRequestObserver() {
+    const originalFetch = window.fetch;
+    if (typeof originalFetch !== 'function' || originalFetch[TOKEN_USAGE_FETCH_PATCHED]) return;
+
+    const observedFetch = function (input, init) {
+        let attempt = null;
+        try {
+            attempt = bindGenerationRequest(input, init);
+        } catch (error) {
+            console.error('[Token Usage Tracker] Error observing generation request:', error);
+        }
+
+        const request = originalFetch.apply(this, arguments);
+        if (attempt) {
+            observeGenerationResponse(attempt, request);
+        }
+        return request;
+    };
+    observedFetch[TOKEN_USAGE_FETCH_PATCHED] = true;
+    window.fetch = observedFetch;
+}
+
+/**
+ * Bind a generation request to the oldest attempt still waiting for one
+ * @param {RequestInfo|URL} input
+ * @param {RequestInit} [init]
+ * @returns {object|null} The bound attempt
+ */
+function bindGenerationRequest(input, init) {
+    const url = input instanceof URL ? input.href : (typeof input === 'string' ? input : input?.url);
+    if (!url) return null;
+    if (!GENERATION_REQUEST_PATHS.has(new URL(url, window.location.origin).pathname)) return null;
+
+    // An already-aborted request belongs to a generation that was stopped before sending
+    const signal = init?.signal ?? input?.signal;
+    if (signal?.aborted) return null;
+
+    const attempt = attemptTracker.bindRequest({ streaming: isStreamingRequestBody(init?.body) });
+    // SillyTavern creates the streaming processor just before sending a streaming request
+    if (attempt?.kind === 'main' && attempt.streaming) {
+        attempt.meta.streamingProcessor = streamingProcessor;
+    }
+    return attempt;
+}
+
+/**
+ * @param {any} body - Request body
+ * @returns {boolean} Whether the request asks for a streamed response
+ */
+function isStreamingRequestBody(body) {
+    if (typeof body !== 'string') return false;
+    try {
+        const data = JSON.parse(body);
+        return data?.stream === true || data?.streaming === true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Settle an attempt from its request's result. Registered before the caller's own
+ * handlers, so the response can still be cloned before the caller reads its body.
+ * @param {object} attempt
+ * @param {Promise<Response>} request
+ */
+function observeGenerationResponse(attempt, request) {
+    request.then(
+        (response) => {
+            if (!response.ok) {
+                attemptTracker.requestSettled(attempt, 'failed');
+                return;
+            }
+            attemptTracker.requestSettled(attempt, 'ok');
+            // Quiet generations emit no event on success (and are never streamed), so the response decides
+            if (attempt.kind === 'quiet' && attempt.status === 'open') {
+                return resolveQuietResponse(attempt, response.clone());
+            }
+        },
+        (error) => {
+            attemptTracker.requestSettled(attempt, error?.name === 'AbortError' ? 'aborted' : 'failed');
+        },
+    ).catch(error => {
+        console.error('[Token Usage Tracker] Error observing generation response:', error);
+    });
+}
+
+/**
+ * Resolve a quiet generation from its (cloned) non-streaming response
+ * @param {object} attempt
+ * @param {Response} response
+ */
+async function resolveQuietResponse(attempt, response) {
+    let data = null;
+    try {
+        data = await response.json();
+    } catch {
+        // Not JSON: count the generation without output text
     }
 
-    await flushQuietGeneration();
-    return true;
+    if (data?.error) {
+        attemptTracker.resolve(attempt, 'failed');
+        return;
+    }
+    attemptTracker.resolve(attempt, 'succeeded', { responseData: data });
 }
 
 /** Unique symbol to mark sendRequest as patched by this extension. */
@@ -4076,46 +4289,48 @@ function tryPatchSendRequest() {
         const originalSendRequest = ServiceClass.sendRequest.bind(ServiceClass);
 
         ServiceClass.sendRequest = async function (profileId, messages, maxTokens, custom, overridePayload) {
-            if (isTrackingBackground) {
-                return await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
-            }
-
-            let inputTokens = 0;
             // Best-effort: captures the globally-selected model/source at call time.
             // May not reflect the actual model used if the extension overrides it.
             const modelId = getCurrentModelId();
             const sourceId = getCurrentSourceId();
 
+            // State is per call so concurrent requests are each tracked
+            const inputTokensPromise = countInputTokens({ prompt: messages }).catch(e => {
+                console.error('[Token Usage Tracker] Error counting sendRequest input:', e);
+                return 0;
+            });
+
+            let result;
             try {
-                isTrackingBackground = true;
-
-                try {
-                    inputTokens = await countInputTokens({ prompt: messages });
-                } catch (e) {
-                    console.error('[Token Usage Tracker] Error counting sendRequest input:', e);
-                }
-
-                const result = await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
-
-                try {
-                    let outputTokens = 0;
-                    if (result && typeof result.content === 'string') {
-                        outputTokens = await countTokens(result.content);
-                    } else if (typeof result === 'string') {
-                        outputTokens = await countTokens(result);
+                result = await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
+            } catch (error) {
+                inputTokensPromise.then(inputTokens => {
+                    if (error?.name === 'AbortError') {
+                        recordUsage(inputTokens, 0, null, modelId, sourceId, 0, 'stopped');
+                    } else {
+                        recordFailedAttempt(null, modelId, sourceId);
                     }
-
-                    if (outputTokens > 0 || inputTokens > 0) {
-                        recordUsage(inputTokens, outputTokens, null, modelId, sourceId);
-                    }
-                } catch (e) {
-                    console.error('[Token Usage Tracker] Error counting sendRequest output:', e);
-                }
-
-                return result;
-            } finally {
-                isTrackingBackground = false;
+                }).catch(e => console.error('[Token Usage Tracker] Error recording sendRequest failure:', e));
+                throw error;
             }
+
+            try {
+                const inputTokens = await inputTokensPromise;
+                let outputTokens = 0;
+                if (result && typeof result.content === 'string') {
+                    outputTokens = await countTokens(result.content);
+                } else if (typeof result === 'string') {
+                    outputTokens = await countTokens(result);
+                }
+
+                if (outputTokens > 0 || inputTokens > 0) {
+                    recordUsage(inputTokens, outputTokens, null, modelId, sourceId);
+                }
+            } catch (e) {
+                console.error('[Token Usage Tracker] Error counting sendRequest output:', e);
+            }
+
+            return result;
         };
 
         ServiceClass.sendRequest[TOKEN_USAGE_PATCHED] = true;
@@ -4125,51 +4340,6 @@ function tryPatchSendRequest() {
         console.error('[Token Usage Tracker] Error in tryPatchSendRequest:', e);
         return false;
     }
-}
-
-/**
- * Generic handler for background generations with recursion guard
- */
-async function handleBackgroundGeneration(originalFn, context, args, inputCounter, outputCounter) {
-    // Avoid double counting if one patched function calls another
-    if (isTrackingBackground) {
-        return await originalFn.apply(context, args);
-    }
-
-    let result;
-    let inputTokens = 0;
-    const modelId = getCurrentModelId();
-    const sourceId = getCurrentSourceId();
-
-    try {
-        isTrackingBackground = true;
-
-        // Count input tokens
-        try {
-            inputTokens = await inputCounter();
-            console.log(`[Token Usage Tracker] Counting background input. Tokens: ${inputTokens}`);
-        } catch (e) {
-            console.error('[Token Usage Tracker] Error counting background input:', e);
-        }
-
-        // Execute original
-        result = await originalFn.apply(context, args);
-
-        // Count output tokens
-        try {
-            const outputTokens = await outputCounter(result);
-            if (outputTokens > 0 || inputTokens > 0) {
-                recordUsage(inputTokens, outputTokens, null, modelId, sourceId);
-                console.log(`[Token Usage Tracker] Background usage recorded: ${inputTokens} in, ${outputTokens} out`);
-            }
-        } catch (e) {
-            console.error('[Token Usage Tracker] Error counting background output:', e);
-        }
-    } finally {
-        isTrackingBackground = false;
-    }
-
-    return result;
 }
 
 jQuery(async () => {
@@ -4201,6 +4371,14 @@ jQuery(async () => {
     eventSource.on(event_types.GENERATION_STOPPED, handleGenerationStopped);
     eventSource.on(event_types.CHAT_CHANGED, handleChatChanged);
     eventSource.on(event_types.IMPERSONATE_READY, handleImpersonateReady);
+    if (event_types.GENERATION_ENDED) {
+        // First, so a streaming error is read before other listeners yield
+        if (typeof eventSource.makeFirst === 'function') {
+            eventSource.makeFirst(event_types.GENERATION_ENDED, handleGenerationEnded);
+        } else {
+            eventSource.on(event_types.GENERATION_ENDED, handleGenerationEnded);
+        }
+    }
 
     // Log current tokenizer
     try {
