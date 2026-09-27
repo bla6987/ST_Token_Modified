@@ -19,6 +19,7 @@ import { getChatCompletionModel, oai_settings } from '../../../openai.js';
 import { textgenerationwebui_settings as textgen_settings } from '../../../textgen-settings.js';
 import { parsePrice, configuredPrice, collectPriceGroups, saveSharedPrice, readPricingSnapshot, matchingPriceModels, applyMatchingPrices } from './pricing.js';
 import { bumpCounts, generationStats, generationPoint, hasCompleteOutcomes, countAxisScale, createAttemptTracker } from './metrics.js';
+import { createErrorStore, normalizeErrorStore, routeFromRequest, payloadError, payloadProvider, describeError, statusFromReason, createStreamScanner, recordRouteOutcome, erroringRoutes, errorBreakdown, errorLabel } from './errors.js';
 
 const extensionName = 'token-usage-tracker';
 
@@ -32,6 +33,7 @@ const _fmtDayDisplay = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIME
 const _fmtDayFull = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 const _fmtHourDisplay = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, hour: 'numeric', hour12: true });
 const _fmtHourFull = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', hour12: true });
+const _fmtMinute = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
 
 function getEasternParts(date) {
     const dtf = new Intl.DateTimeFormat('en-US', {
@@ -158,6 +160,8 @@ const defaultSettings = {
         // When stopped/failed counting began (ISO); older buckets have no outcome data
         outcomesTrackedSince: null,
     },
+    // API errors by route (source · endpoint host · model · provider), see errors.js
+    errorTracking: createErrorStore(),
 };
 
 /**
@@ -189,6 +193,7 @@ function loadSettings() {
     if (!settings.modelPrices) settings.modelPrices = {};
     if (!settings.sharedModelPrices) settings.sharedModelPrices = {};
     if (!settings.modelPriceGroups) settings.modelPriceGroups = {};
+    settings.errorTracking = normalizeErrorStore(settings.errorTracking);
 
     // Migration: Convert byDay.models from numeric format to object format
     // Old: models[modelId] = totalTokens (number)
@@ -1254,6 +1259,39 @@ function registerSlashCommands() {
         returns: 'Miniview toggle status',
         helpString: 'Toggles the compact miniview panel showing session/hourly/daily token usage.',
     }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'tokenerrors',
+        callback: async (_args, value) => {
+            if (String(value ?? '').trim().toLowerCase() === 'clear') {
+                clearErrorTracking();
+                return 'API errors cleared.';
+            }
+
+            const routes = erroringRoutes(getSettings().errorTracking);
+            if (!routes.length) {
+                return 'No API errors recorded.';
+            }
+
+            const lines = ['**API errors by route:**'];
+            for (const route of routes) {
+                const breakdown = errorBreakdown(route).map(([name, count]) => `${name} ×${count}`).join(', ');
+                const last = route.lastError ? ` Last (${formatErrorTime(route.lastError.at)}): ${route.lastError.message}` : '';
+                lines.push(`• ${route.model} (${formatRouteWhere(route)}): ${route.errors} of ${route.attempts} failed (${formatErrorRate(route.errorRate)}), ${breakdown}.${last}`);
+            }
+            return lines.join('\n');
+        },
+        returns: 'API errors by source, endpoint, model and provider',
+        helpString: 'Lists API errors by route: source, endpoint host, model and provider. Use /tokenerrors clear to clear them.',
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({
+                description: '"clear" to clear recorded errors',
+                typeList: ['string'],
+                isRequired: false,
+                enumList: ['clear'],
+            }),
+        ],
+    }));
 }
 
 /**
@@ -1271,6 +1309,11 @@ window['TokenUsageTracker'] = {
     getCurrentModelId,
     getCurrentSourceId,
     flushPendingQuietGeneration,
+    // API errors by route (source, endpoint host, model, provider), most errors first
+    getErrorRoutes: () => erroringRoutes(getSettings().errorTracking),
+    // Recent API errors, oldest first
+    getErrorLog: () => [...getSettings().errorTracking.log],
+    clearErrors: clearErrorTracking,
     // Subscribe to updates
     onUpdate: (callback) => {
         eventSource.on('tokenUsageUpdated', callback);
@@ -1521,7 +1564,8 @@ function exportUsageData() {
         modelPrices: settings.modelPrices,
         sharedModelPrices: settings.sharedModelPrices,
         modelPriceGroups: settings.modelPriceGroups,
-        modelColors: settings.modelColors
+        modelColors: settings.modelColors,
+        errorTracking: settings.errorTracking,
     };
 }
 
@@ -1629,8 +1673,14 @@ function importUsageData(jsonString) {
         Object.assign(settings.modelColors, data.modelColors);
     }
 
+    // Replace API errors when the export has them
+    if (data.errorTracking) {
+        settings.errorTracking = normalizeErrorStore(data.errorTracking);
+    }
+
     saveSettings();
     eventSource.emit('tokenUsageUpdated', getUsageStats());
+    renderErrorPanel();
 
     return {
         success: true,
@@ -3726,6 +3776,113 @@ function renderPriceGroup(group, groups, settings) {
     </section>`;
 }
 
+/** Routes and recent errors shown in the API Errors panel */
+const ERROR_PANEL_ROUTE_LIMIT = 25;
+const ERROR_PANEL_RECENT_LIMIT = 20;
+let errorPanelRenderTimer = null;
+
+/**
+ * Clear all recorded API errors and route counts
+ */
+function clearErrorTracking() {
+    getSettings().errorTracking = createErrorStore();
+    saveSettings();
+    renderErrorPanel();
+}
+
+/**
+ * @param {object} route
+ * @returns {string} Where a route goes: source · endpoint host · provider
+ */
+function formatRouteWhere(route) {
+    return [formatSourceName(route.source), route.host, route.provider].filter(Boolean).join(' · ');
+}
+
+/**
+ * @param {number} rate Share of failed requests (0-1)
+ * @returns {string}
+ */
+function formatErrorRate(rate) {
+    return rate > 0 && rate < 0.01 ? '<1%' : `${Math.round(rate * 100)}%`;
+}
+
+/**
+ * @param {number} at Timestamp (ms)
+ * @returns {string}
+ */
+function formatErrorTime(at) {
+    return Number.isFinite(at) ? _fmtMinute.format(new Date(at)) : '';
+}
+
+/**
+ * Render the API Errors panel soon, once for a burst of results
+ */
+function scheduleErrorPanelRender() {
+    if (errorPanelRenderTimer) return;
+    errorPanelRenderTimer = setTimeout(() => {
+        errorPanelRenderTimer = null;
+        renderErrorPanel();
+    }, 250);
+}
+
+/**
+ * Update the API Errors count, and the panel's lists while their drawer is open
+ * (even when the extensions panel around it is closed, so they are never stale)
+ */
+function renderErrorPanel() {
+    const store = getSettings().errorTracking;
+    const routes = erroringRoutes(store);
+    const totalErrors = routes.reduce((sum, route) => sum + route.errors, 0);
+    $('#token-usage-errors-count').text(totalErrors ? `(${formatCount(totalErrors)})` : '');
+
+    const content = document.getElementById('token-usage-errors-content');
+    const body = document.getElementById('token-usage-errors-body');
+    if (!content || !body || getComputedStyle(content).display === 'none') return;
+
+    if (!routes.length) {
+        body.innerHTML = '<p class="price-empty">No API errors recorded. Chat and text completion errors are listed here by source, endpoint, model and provider.</p>';
+        return;
+    }
+
+    const routeItems = routes.slice(0, ERROR_PANEL_ROUTE_LIMIT).map(route => {
+        const chips = errorBreakdown(route)
+            .map(([name, count]) => `<span class="error-chip">${escapeHtml(name)} ×${formatCount(count)}</span>`)
+            .join('');
+        const last = route.lastError;
+        return `
+            <li class="error-route">
+                <div class="error-route-head">
+                    <span class="error-route-model">${escapeHtml(route.model)}</span>
+                    <span class="error-route-rate" title="${route.errors} of ${route.attempts} requests failed">${formatCount(route.errors)} / ${formatCount(route.attempts)} · ${formatErrorRate(route.errorRate)}</span>
+                </div>
+                <div class="error-route-where">${escapeHtml(formatRouteWhere(route))}</div>
+                <div class="error-route-chips">${chips}</div>
+                ${last ? `<div class="error-route-last" title="${escapeHtml(last.message)}">${escapeHtml(formatErrorTime(last.at))} · ${escapeHtml(last.message)}</div>` : ''}
+            </li>`;
+    }).join('');
+    const hiddenRoutes = routes.length - ERROR_PANEL_ROUTE_LIMIT;
+
+    const recentItems = store.log.slice(-ERROR_PANEL_RECENT_LIMIT).reverse().map(entry => `
+        <li title="${escapeHtml(entry.message)}">
+            <span class="error-recent-time">${escapeHtml(formatErrorTime(entry.at))}</span>
+            <span class="error-chip">${escapeHtml(errorLabel(entry))}</span>
+            <span class="error-recent-route">${escapeHtml(entry.model)}${entry.host ? ` @ ${escapeHtml(entry.host)}` : ''}</span>
+            <span class="error-recent-message">${escapeHtml(entry.message)}</span>
+        </li>`).join('');
+
+    // Keep the recent list open across re-renders
+    const recentOpen = body.querySelector('.error-recent')?.open ? ' open' : '';
+    const tracked = Object.keys(store.routes).length;
+    body.innerHTML = `
+        <p class="price-help">${routes.length} of ${tracked} ${tracked === 1 ? 'route' : 'routes'} returned errors. Counts are failed / total requests.</p>
+        <ul class="error-routes">${routeItems}</ul>
+        ${hiddenRoutes > 0 ? `<p class="price-help">${hiddenRoutes} more: use /tokenerrors for the full list.</p>` : ''}
+        <details class="error-recent"${recentOpen}>
+            <summary>Recent errors (${store.log.length})</summary>
+            <ol>${recentItems}</ol>
+        </details>`;
+}
+
 /**
  * Create the settings UI in the extensions panel
  */
@@ -3895,6 +4052,20 @@ function createSettingsUI() {
                         </div>
                     </div>
 
+                    <!-- API Errors by route -->
+                    <div class="inline-drawer" style="margin-bottom: 10px;">
+                        <div id="token-usage-errors-toggle" class="inline-drawer-toggle inline-drawer-header" style="padding: 4px 0 4px 8px;">
+                            <span style="font-size: 11px;">API Errors <span id="token-usage-errors-count" class="error-count"></span></span>
+                            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                        </div>
+                        <div id="token-usage-errors-content" class="inline-drawer-content">
+                            <div id="token-usage-errors-body"></div>
+                            <div class="error-actions">
+                                <button id="token-usage-errors-clear" type="button" class="menu_button">Clear errors</button>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Config (Model Colors & Prices) -->
                     <div class="inline-drawer" style="margin-top: 10px;">
                         <div id="token-usage-config-toggle" class="inline-drawer-toggle inline-drawer-header" style="padding: 4px 0 4px 8px;">
@@ -3977,6 +4148,16 @@ function createSettingsUI() {
     $('#token-usage-main-toggle').on('click', syncConfigAfterToggle);
     $('#token-usage-config-toggle').on('click', syncConfigAfterToggle);
     syncModelConfigVisibility(true);
+
+    // API errors: the lists render only while their drawer is open, so render when it opens
+    $('#token-usage-errors-toggle').on('click', () => setTimeout(renderErrorPanel, 0));
+    $('#token-usage-errors-clear').on('click', () => {
+        if (confirm('Clear all recorded API errors and route counts?')) {
+            clearErrorTracking();
+            toastr.success('API errors cleared');
+        }
+    });
+    renderErrorPanel();
 
     // Range button handlers
     document.querySelectorAll('.token-usage-range-btn').forEach(btn => {
@@ -4148,7 +4329,8 @@ const GENERATION_REQUEST_PATHS = new Set([
 const TOKEN_USAGE_FETCH_PATCHED = Symbol.for('tokenUsageTrackerFetchPatched');
 
 /**
- * Observe generation requests to learn whether each attempt reached the API and how it ended.
+ * Observe generation requests to learn whether each attempt reached the API and how it ended,
+ * and which routes (source, endpoint, model, provider) return errors.
  * The request itself and the caller's Response are never modified.
  */
 function installGenerationRequestObserver() {
@@ -4156,16 +4338,16 @@ function installGenerationRequestObserver() {
     if (typeof originalFetch !== 'function' || originalFetch[TOKEN_USAGE_FETCH_PATCHED]) return;
 
     const observedFetch = function (input, init) {
-        let attempt = null;
+        let observation = null;
         try {
-            attempt = bindGenerationRequest(input, init);
+            observation = observeGenerationRequest(input, init);
         } catch (error) {
             console.error('[Token Usage Tracker] Error observing generation request:', error);
         }
 
         const request = originalFetch.apply(this, arguments);
-        if (attempt) {
-            observeGenerationResponse(attempt, request);
+        if (observation) {
+            observeGenerationResponse(observation, request);
         }
         return request;
     };
@@ -4174,63 +4356,86 @@ function installGenerationRequestObserver() {
 }
 
 /**
- * Bind a generation request to the oldest attempt still waiting for one
+ * Bind a generation request to the oldest attempt still waiting for one and identify its route.
+ * Requests with no attempt (Connection Manager profiles, connection tests) still have a route.
  * @param {RequestInfo|URL} input
  * @param {RequestInit} [init]
- * @returns {object|null} The bound attempt
+ * @returns {{attempt: object|null, route: object|null, streaming: boolean, signal: AbortSignal|null, genType: string}|null}
  */
-function bindGenerationRequest(input, init) {
+function observeGenerationRequest(input, init) {
     const url = input instanceof URL ? input.href : (typeof input === 'string' ? input : input?.url);
     if (!url) return null;
-    if (!GENERATION_REQUEST_PATHS.has(new URL(url, window.location.origin).pathname)) return null;
+    const path = new URL(url, window.location.origin).pathname;
+    if (!GENERATION_REQUEST_PATHS.has(path)) return null;
 
     // An already-aborted request belongs to a generation that was stopped before sending
-    const signal = init?.signal ?? input?.signal;
+    const signal = init?.signal ?? input?.signal ?? null;
     if (signal?.aborted) return null;
 
-    const attempt = attemptTracker.bindRequest({ streaming: isStreamingRequestBody(init?.body) });
+    const body = parseRequestBody(init?.body);
+    const streaming = body?.stream === true || body?.streaming === true;
+    const attempt = attemptTracker.bindRequest({ streaming });
     // SillyTavern creates the streaming processor just before sending a streaming request
     if (attempt?.kind === 'main' && attempt.streaming) {
         attempt.meta.streamingProcessor = streamingProcessor;
     }
-    return attempt;
+    const route = routeFromRequest(path, body);
+    if (!attempt && !route) return null;
+    return { attempt, route, streaming, signal, genType: attempt?.meta.genType || '' };
 }
 
 /**
  * @param {any} body - Request body
- * @returns {boolean} Whether the request asks for a streamed response
+ * @returns {any} The parsed JSON body, or null
  */
-function isStreamingRequestBody(body) {
-    if (typeof body !== 'string') return false;
+function parseRequestBody(body) {
+    if (typeof body !== 'string') return null;
     try {
-        const data = JSON.parse(body);
-        return data?.stream === true || data?.streaming === true;
+        return JSON.parse(body);
     } catch {
-        return false;
+        return null;
     }
 }
 
 /**
- * Settle an attempt from its request's result. Registered before the caller's own
- * handlers, so the response can still be cloned before the caller reads its body.
- * @param {object} attempt
+ * Whether a request or its body failed because it was aborted. SillyTavern often
+ * aborts with a reason, which rejects with that reason instead of an AbortError.
+ * @param {{signal: AbortSignal|null}} observation
+ * @param {any} error
+ * @returns {boolean}
+ */
+function isAbortedRequest(observation, error) {
+    const signal = observation.signal;
+    return error?.name === 'AbortError' || (signal?.aborted === true && error === signal.reason);
+}
+
+/**
+ * Settle an attempt and record the route's result from the request's response.
+ * Registered before the caller's own handlers, so the response can still be
+ * cloned before the caller reads its body.
+ * @param {{attempt: object|null, route: object|null, streaming: boolean, signal: AbortSignal|null}} observation
  * @param {Promise<Response>} request
  */
-function observeGenerationResponse(attempt, request) {
+function observeGenerationResponse(observation, request) {
+    const { attempt, route, streaming } = observation;
     request.then(
         (response) => {
             if (!response.ok) {
                 attemptTracker.requestSettled(attempt, 'failed');
-                return;
+                return route && recordHttpError(observation, response.clone());
             }
             attemptTracker.requestSettled(attempt, 'ok');
-            // Quiet generations emit no event on success (and are never streamed), so the response decides
-            if (attempt.kind === 'quiet' && attempt.status === 'open') {
-                return resolveQuietResponse(attempt, response.clone());
+            if (streaming) {
+                return route && watchStreamedResponse(observation, response.clone());
             }
+            return inspectResponse(observation, response.clone());
         },
         (error) => {
-            attemptTracker.requestSettled(attempt, error?.name === 'AbortError' ? 'aborted' : 'failed');
+            const aborted = isAbortedRequest(observation, error);
+            attemptTracker.requestSettled(attempt, aborted ? 'aborted' : 'failed');
+            if (route && !aborted) {
+                recordRouteResult(observation, { kind: 'network', message: error?.message || String(error) });
+            }
         },
     ).catch(error => {
         console.error('[Token Usage Tracker] Error observing generation response:', error);
@@ -4238,11 +4443,14 @@ function observeGenerationResponse(attempt, request) {
 }
 
 /**
- * Resolve a quiet generation from its (cloned) non-streaming response
- * @param {object} attempt
+ * Read a (cloned) non-streaming response. An error payload, which OpenAI-compatible
+ * sources return with HTTP 200, fails the attempt: it gets no message event.
+ * Quiet generations emit no event on success, so the response resolves them.
+ * @param {{attempt: object|null, route: object|null}} observation
  * @param {Response} response
  */
-async function resolveQuietResponse(attempt, response) {
+async function inspectResponse(observation, response) {
+    const { attempt, route } = observation;
     let data = null;
     try {
         data = await response.json();
@@ -4250,11 +4458,96 @@ async function resolveQuietResponse(attempt, response) {
         // Not JSON: count the generation without output text
     }
 
-    if (data?.error) {
-        attemptTracker.resolve(attempt, 'failed');
-        return;
+    const error = payloadError(data);
+    if (route) {
+        const routeError = error && { kind: 'response', status: statusFromReason(error.message), ...error };
+        recordRouteResult(observation, routeError, payloadProvider(data));
     }
-    attemptTracker.resolve(attempt, 'succeeded', { responseData: data });
+    if (error) {
+        attemptTracker.resolve(attempt, 'failed');
+    } else if (attempt?.kind === 'quiet') {
+        attemptTracker.resolve(attempt, 'succeeded', { responseData: data });
+    }
+}
+
+/**
+ * Record a (cloned) HTTP error response against its route
+ * @param {{route: object}} observation
+ * @param {Response} response
+ */
+async function recordHttpError(observation, response) {
+    let body = '';
+    try {
+        body = await response.text();
+    } catch {
+        // Body unavailable: the status is enough
+    }
+    let data = body;
+    try {
+        data = JSON.parse(body);
+    } catch {
+        // Plain text or an HTML error page
+    }
+    const error = { kind: 'http', status: response.status, ...describeError(data, response.statusText) };
+    recordRouteResult(observation, error, payloadProvider(data));
+}
+
+/**
+ * Read a (cloned) streamed response alongside SillyTavern. SillyTavern only shows a toast
+ * for an error event and then ends the stream like a successful one, so the error is
+ * recorded here and fails the attempt.
+ * @param {{attempt: object|null, route: object, signal: AbortSignal|null}} observation
+ * @param {Response} response
+ */
+async function watchStreamedResponse(observation, response) {
+    const reader = response.body?.getReader();
+    if (!reader) return;
+    const scanner = createStreamScanner();
+    const decoder = new TextDecoder();
+    let error = null;
+    try {
+        while (!error) {
+            const { done, value } = await reader.read();
+            const errors = done
+                ? [...scanner.push(decoder.decode()), ...scanner.finish()]
+                : scanner.push(decoder.decode(value, { stream: true }));
+            if (errors.length) error = { kind: 'stream', ...errors[0] };
+            if (done) break;
+        }
+    } catch (readError) {
+        if (!isAbortedRequest(observation, readError)) {
+            error = { kind: 'interrupted', message: readError?.message || String(readError) };
+        } else {
+            // SillyTavern aborts a stream it failed to read (onErrorStreaming), possibly before
+            // this copy reached the failing event; any other abort is a user stop
+            const sp = observation.attempt?.meta.streamingProcessor;
+            if (!(sp?.isStopped === true && sp.isFinished !== true)) return;
+            error = { kind: 'stream', message: 'SillyTavern could not read the stream' };
+        }
+    }
+    // Stop buffering the rest of this copy of the stream
+    if (error) reader.cancel().catch(() => {});
+
+    recordRouteResult(observation, error, scanner.provider);
+    if (error) attemptTracker.resolve(observation.attempt, 'failed');
+}
+
+/**
+ * Record how a request to a route ended
+ * @param {{route: object, genType?: string}} observation
+ * @param {object|null} error null for success
+ * @param {string} [provider] Upstream provider named by the response
+ */
+function recordRouteResult({ route, genType }, error, provider = '') {
+    recordRouteOutcome(getSettings().errorTracking, provider ? { ...route, provider } : route, error, {
+        now: getCurrentEasternTime().getTime(),
+        genType: genType || '',
+    });
+    saveSettings();
+    if (error) {
+        console.warn(`[Token Usage Tracker] API error (${errorLabel(error)}) from ${route.model} via ${route.source}${route.host ? ` @ ${route.host}` : ''}: ${error.message}`);
+    }
+    scheduleErrorPanelRender();
 }
 
 /** Unique symbol to mark sendRequest as patched by this extension. */

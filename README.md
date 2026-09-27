@@ -44,6 +44,12 @@ A SillyTavern extension that tracks and visualizes token usage and price for you
 - Stopped and failed generation attempts, with success rate, tracked from version 1.2.0 onward
 - `/tokentoday` shows today's and this hour's generations, stopped, failed and success rate
 
+### API Error Tracking
+- Errors from chat and text completion requests, grouped by route: source, endpoint host, model and provider
+- Error counts and failure rate per route, broken down by HTTP status or error type, plus a log of recent errors
+- Catches errors SillyTavern only shows as a toast: error payloads sent with HTTP 200 and error events in the middle of a stream
+- `/tokenerrors` lists routes with errors; `/tokenerrors clear` clears them
+
 ### Time Synchronization
 - External time sync with worldtimeapi.org for Eastern timezone
 - 5-minute auto-resync interval for time drift correction
@@ -59,6 +65,7 @@ Once installed, the extension will automatically start tracking token usage. The
 
 - Use `/tokenmini` to toggle the compact miniview
 - Use `/tokenchat` to view current chat statistics
+- Use `/tokenerrors` to list API errors by source, endpoint, model and provider
 
 ### Shared model pricing
 
@@ -88,7 +95,29 @@ Switch the chart to **Generations** to plot how many generations ran per hour or
 - **Attempts** = generations + failed. **Success rate** = (generations − stopped) ÷ attempts.
 - Periods that began before stopped/failed tracking started show **—** instead of a success rate.
 
-Failures are inferred from SillyTavern's generation lifecycle and each request's result; there is no per-status-code breakdown (a 429 usually reaches the browser as a generic error). Calls made with `generateRaw` are not tracked.
+Failures are inferred from SillyTavern's generation lifecycle and each request's result, including error payloads and error events in a stream. Calls made with `generateRaw` are not counted as generations (their errors still appear under **API Errors**).
+
+### API errors
+
+Open **Token Usage Tracker → API Errors** to see which API, provider and model combinations return errors. Each route is one combination of:
+
+- **Source:** the chat completion source (for example Custom (OpenAI-compatible) or OpenRouter), or the text completion API type.
+- **Endpoint:** the host of the custom URL, reverse proxy or text completion server. Only the host is stored, never the path, query or credentials.
+- **Model:** the model ID sent with the request.
+- **Provider:** the upstream provider named in the response (OpenRouter reports which provider served or failed a request), otherwise the requested provider order.
+
+Each route shows failed / total requests, the error rate, a breakdown by HTTP status or error type, and the latest error message. **Recent errors** lists the last 20 errors; the last 100 are kept. Every generation request is tracked, including Connection Manager profile requests, background generations and connection tests.
+
+Error types, when there is no HTTP status:
+
+- **stream:** the stream contained an error event, an event that was not JSON, or SillyTavern could not read it.
+- **interrupted:** the connection dropped during a stream.
+- **network:** the request never reached SillyTavern's server.
+- An error code from the payload, when one is given.
+
+SillyTavern answers a failed non-streaming OpenAI-compatible request with HTTP 200 and only the upstream's status text; when that text is a standard reason phrase (such as "Too Many Requests") it is counted under its status (429). Stopping a generation is never counted as an error. Errors are kept separately from usage, so **Reset All** does not clear them; use **Clear errors** or `/tokenerrors clear`. `/tokenexport` and `/tokenimport` include them.
+
+Other extensions can read the data from `window.TokenUsageTracker.getErrorRoutes()` and `getErrorLog()`.
 
 Run the regression tests with `node --test tests/` (Node 22.7+).
 

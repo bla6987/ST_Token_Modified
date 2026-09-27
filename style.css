@@ -164,6 +164,113 @@
   outline-offset: 2px;
 }
 
+/* ===== API Errors ===== */
+
+#token_usage_tracker_container .error-count {
+  font-size: 10px;
+  opacity: 0.7;
+}
+#token_usage_tracker_container .error-routes,
+#token_usage_tracker_container .error-recent ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+#token_usage_tracker_container .error-route {
+  min-width: 0;
+  margin-bottom: 6px;
+  padding: 7px 9px;
+  border: 1px solid var(--SmartThemeBorderColor);
+  border-radius: 6px;
+  background: var(--SmartThemeInputColor);
+  color: var(--SmartThemeBodyColor);
+  font-size: 11px;
+}
+#token_usage_tracker_container .error-route-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+#token_usage_tracker_container .error-route-model {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+#token_usage_tracker_container .error-route-rate {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+#token_usage_tracker_container .error-route-where,
+#token_usage_tracker_container .error-route-last {
+  margin-top: 2px;
+  font-size: 10px;
+  opacity: 0.65;
+  overflow-wrap: anywhere;
+}
+#token_usage_tracker_container .error-route-last {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+#token_usage_tracker_container .error-route-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+#token_usage_tracker_container .error-chip {
+  padding: 0 5px;
+  border: 1px solid var(--SmartThemeBorderColor);
+  border-radius: 4px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+#token_usage_tracker_container .error-recent {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--SmartThemeBodyColor);
+}
+#token_usage_tracker_container .error-recent summary {
+  cursor: pointer;
+  font-size: 11px;
+  opacity: 0.8;
+}
+#token_usage_tracker_container .error-recent li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 6px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--SmartThemeBorderColor);
+}
+#token_usage_tracker_container .error-recent-time {
+  opacity: 0.6;
+  white-space: nowrap;
+}
+#token_usage_tracker_container .error-recent-route {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+#token_usage_tracker_container .error-recent-message {
+  flex-basis: 100%;
+  opacity: 0.75;
+  overflow-wrap: anywhere;
+}
+#token_usage_tracker_container .error-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+#token_usage_tracker_container .error-actions .menu_button {
+  width: auto;
+  margin: 0;
+  padding: 4px 8px;
+  font-size: 10px;
+}
+
 /* ===== Compact Miniview Styles ===== */
 
 .token-usage-miniview {

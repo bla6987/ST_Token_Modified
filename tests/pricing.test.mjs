@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import * as pricing from '../pricing.js';
+import { normalizeErrorStore } from '../errors.js';
 
 const state = () => ({ modelPrices: {}, sharedModelPrices: {}, modelPriceGroups: {} });
 const rate = { in: 3, out: 15 };
@@ -120,7 +121,7 @@ function runtime(settings) {
         modelPriceCache: new Map(), modelConfigState: {}, modelConfigPriceDrafts: new Map(),
         saveSettings() {}, getUsageStats: () => ({}), eventSource: { emit() {} },
         getCurrentEasternTime: () => new Date('2026-09-12T12:00:00Z'), extensionName: 'token-usage-tracker',
-        console: { log() {} },
+        console: { log() {} }, normalizeErrorStore, renderErrorPanel() {},
     });
     for (const name of ['invalidateModelPriceCache', 'getModelPrice', 'calculateCost', 'exportUsageData', 'importUsageData']) {
         vm.runInContext(extract(name), context);
@@ -187,17 +188,21 @@ test('actual bulk click uses the live search before debounce, clears affected dr
 });
 
 test('actual export/import restores removed overrides and links exactly', () => {
-    const s = { ...state(), usage: {}, modelColors: {} };
+    const errorTracking = { routes: { 'custom||m|': { ok: 1, errors: 2 } }, log: [{ message: 'Rate limited' }] };
+    const s = { ...state(), usage: {}, modelColors: {}, errorTracking };
     pricing.saveSharedPrice(s, group, rate);
     s.modelPriceGroups.alias = group;
     const r = runtime(s);
     const backup = JSON.stringify(r.exportUsageData());
     s.modelPrices[model] = { in: 9, out: 99 };
     s.modelPriceGroups.alias = 'exact:alias';
+    s.errorTracking = { routes: {}, log: [] };
     r.importUsageData(backup);
     assert.equal(pricing.configuredPrice(s, model).source, 'Shared');
     assert.equal(pricing.priceGroupFor(s, 'alias'), group);
     assert.equal(r.calculateCost(1e6, 1e6, 'alias'), 18);
+    // Parsed in the vm context, so compare by value
+    assert.equal(JSON.stringify(s.errorTracking), JSON.stringify(errorTracking));
 });
 
 test('old pricing imports still work and malformed new backups fail before usage changes', () => {
