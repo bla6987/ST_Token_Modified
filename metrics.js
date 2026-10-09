@@ -133,7 +133,9 @@ export function createAttemptTracker({
         // response without a message (tool-call round) or never got one.
         if (kind === 'main') {
             for (const previous of open.filter(attempt => attempt.kind === 'main')) {
-                resolve(previous, previous.request === 'ok' ? 'succeeded' : 'failed');
+                const hasResponse = previous.request === 'ok'
+                    && (!previous.ended || previous.streamHasOutput || previous.meta.hasToolCalls);
+                resolve(previous, hasResponse ? 'succeeded' : 'failed', hasResponse ? {} : { failureCode: 'no_response' });
             }
         }
         const attempt = {
@@ -174,17 +176,22 @@ export function createAttemptTracker({
         return true;
     }
 
-    function generationEnded({ streamError = false } = {}) {
+    function generationEnded({ streamError = false, streamHasOutput = false } = {}) {
         const main = oldestOpen('main');
+        if (main) {
+            main.ended = true;
+            main.streamHasOutput = streamHasOutput;
+        }
         if (main && main.streaming && streamError) {
-            resolve(main, 'failed');
+            resolve(main, 'failed', { failureCode: 'stream_error' });
         }
 
         // A user stop reports right after this event, so decide only after a grace
-        // period. Streaming attempts are left open: their message arrives after it.
+        // period. A stream with output can finalize its message after this event;
+        // a stream without output must not stay open indefinitely.
         setTimer(() => {
-            if (main && main.status === 'open' && !main.streaming && main.request !== 'sent') {
-                resolve(main, 'failed');
+            if (main && main.status === 'open' && !(main.streaming && streamHasOutput)) {
+                resolve(main, 'failed', { failureCode: 'no_response' });
             }
             const cutoff = now() - pendingSweepAgeMs;
             for (const attempt of open.filter(a => a.request === 'pending' && !a.streaming && a.createdAt <= cutoff)) {

@@ -15,13 +15,13 @@ function extract(name) {
 }
 
 const FUNCTIONS = [
-    'getEasternParts', 'getDayKey', 'getHourKey', 'getWeekKey', 'getMonthKey',
+    'getEasternParts', 'getDayKey', 'getHourKey', 'getWeekKey', 'getMonthKey', 'snapshotGenerationRoute',
     'addToUsageBuckets', 'recordUsage', 'recordFailedAttempt',
-    'handleGenerationStarted', 'handleGenerateAfterData', 'handleMessageReceived', 'handleImpersonateReady',
+    'handleGenerationStarted', 'handleGenerationAfterCommands', 'handleGenerateAfterData', 'handleMessageReceived', 'handleImpersonateReady',
     'handleGenerationStopped', 'handleGenerationEnded', 'handleAttemptResolved', 'recordAttempt',
     'countMessageOutput', 'extractResponseText', 'flushPendingQuietGeneration',
     'installGenerationRequestObserver', 'observeGenerationRequest', 'parseRequestBody', 'isAbortedRequest',
-    'observeGenerationResponse', 'inspectResponse', 'recordHttpError', 'watchStreamedResponse', 'recordRouteResult',
+    'observeGenerationResponse', 'inspectResponse', 'recordHttpError', 'watchStreamedResponse', 'recordRouteResult', 'recordInferredFailure',
 ];
 
 const emptyUsage = () => ({
@@ -49,9 +49,12 @@ function runtime() {
         saveSettings() {},
         getUsageStats: () => ({}),
         eventSource: { emit() {} },
+        event_types: { GENERATION_AFTER_COMMANDS: 'after_commands' },
         getCurrentEasternTime: () => new Date(clock),
         getFriendlyTokenizerName: () => ({ tokenizerName: 'test' }),
         main_api: 'openai',
+        oai_settings: {},
+        textgen_settings: {},
         lastRecordedTimestamp: null,
         maybeAutoFetchOpenRouterPricing() {},
         recordHealthError() {},
@@ -66,6 +69,7 @@ function runtime() {
         stScript: { extractMessageFromData: (data) => data?.choices?.[0]?.message?.content ?? '' },
         extractResponseReasoning: async (data) => data?.choices?.[0]?.message?.reasoning ?? '',
         window: {
+            setTimeout: (fn, ms) => timers.push({ fn, at: clock + ms }),
             location: { origin: 'http://localhost:8000' },
             fetch: async () => {
                 const next = responses.shift();
@@ -98,11 +102,15 @@ function runtime() {
         chat,
         settle,
         async advance(ms) {
-            clock += ms;
-            for (const timer of timers.filter(t => t.at <= clock)) {
+            const target = clock + ms;
+            while (timers.some(t => t.at <= target)) {
+                const timer = timers.filter(t => t.at <= target).sort((a, b) => a.at - b.at)[0];
+                clock = timer.at;
                 timers.splice(timers.indexOf(timer), 1);
                 timer.fn();
+                await settle();
             }
+            clock = target;
             await settle();
         },
         respond(response) {
@@ -394,6 +402,225 @@ test('dry runs and non-API messages are ignored; external recordUsage callers st
 const encoder = new TextEncoder();
 const CUSTOM = { chat_completion_source: 'custom', model: 'glm-4.6', custom_url: 'https://api.example.com/v1' };
 const CUSTOM_KEY = 'custom|api.example.com|glm-4.6|';
+
+test('a successful HTTP response without a message becomes one timed route failure', async () => {
+    const r = runtime();
+    r.context.handleGenerationStarted('normal', {}, false);
+    r.context.handleGenerateAfterData({ prompt: [] }, false);
+    r.respond(ok({ choices: [] }));
+    await r.send({ body: CUSTOM });
+    await r.settle();
+    const endedAt = Date.parse('2026-09-24T21:00:00Z');
+    r.context.handleGenerationEnded();
+    await r.advance(5000);
+    const route = r.route(CUSTOM_KEY);
+    assert.equal(route.errors, 1);
+    assert.equal(route.ok, 0, 'do not count the same request as both success and failure');
+    assert.equal(route.lastError.code, 'no_response');
+    assert.equal(route.lastError.at, endedAt, 'timestamp is the end event, not the delayed check');
+    assert.equal(r.settings.errorTracking.log.length, 1);
+    assert.deepEqual(counts(r.today()), { messageCount: 0, stopped: 0, failed: 1 });
+});
+
+test('an armed failure before prompt construction logs the API snapshot; a stop stays silent', async () => {
+    for (const stopped of [false, true]) {
+        const r = runtime();
+        r.context.handleGenerationStarted('normal', {}, false);
+        r.context.handleGenerationAfterCommands('normal', {}, false);
+        r.context.handleGenerationEnded();
+        if (stopped) r.context.handleGenerationStopped();
+        r.context.getCurrentModelId = () => 'later-model';
+        r.context.getCurrentSourceId = () => 'later-api';
+        await r.advance(5000);
+        assert.equal(r.settings.errorTracking.log.length, stopped ? 0 : 1);
+        if (!stopped) {
+            assert.equal(r.settings.errorTracking.log[0].model, 'model-a');
+            assert.equal(r.settings.errorTracking.log[0].source, 'openrouter');
+        }
+    }
+});
+
+test('pre-request route snapshots select the current endpoint and discard URL credentials', () => {
+    const r = runtime();
+    r.context.oai_settings = { custom_url: 'https://user:password@custom.example/v1?key=secret',
+        reverse_proxy: 'https://proxy.example/v1', azure_base_url: 'https://azure.example/' };
+    assert.equal(r.context.snapshotGenerationRoute('m', 'custom').host, 'custom.example');
+    assert.equal(r.context.snapshotGenerationRoute('m', 'openrouter').host, '', 'ignore stale custom/proxy settings');
+    assert.equal(r.context.snapshotGenerationRoute('m', 'openai').host, 'proxy.example');
+    assert.equal(r.context.snapshotGenerationRoute('m', 'azure_openai').host, 'azure.example');
+    r.context.main_api = 'textgenerationwebui';
+    r.context.textgen_settings = { type: 'koboldcpp', server_urls: { koboldcpp: 'https://text.example:5001/path?token=secret' } };
+    const route = r.context.snapshotGenerationRoute('m', 'textgenerationwebui');
+    assert.equal(route.source, 'koboldcpp');
+    assert.equal(route.host, 'text.example:5001');
+});
+
+test('slash-command-only starts and dry runs never create fallback failures', async () => {
+    const r = runtime();
+    r.context.handleGenerationStarted('normal', {}, false);
+    r.context.handleGenerationEnded();
+    await r.advance(5000);
+    r.context.handleGenerationStarted('normal', {}, true);
+    r.context.handleGenerationAfterCommands('normal', {}, true);
+    r.context.handleGenerationEnded();
+    await r.advance(5000);
+    assert.equal(r.settings.errorTracking.log.length, 0);
+    assert.equal(r.today(), undefined);
+});
+
+test('empty chat and quiet replies are failures; unchanged continues add no generation', async () => {
+    for (const type of ['normal', 'quiet', 'continue', 'impersonate']) {
+        const r = runtime();
+        if (type === 'continue') r.chat.push({ mes: 'previous reply' });
+        r.context.handleGenerationStarted(type, {}, false);
+        r.context.handleGenerateAfterData({ prompt: [] }, false);
+        r.respond(ok({ choices: [{ message: { content: '  ' } }] }));
+        await r.send({ body: CUSTOM });
+        await r.settle();
+        if (type === 'normal') {
+            r.chat.push({ mes: '  ' });
+            r.context.handleMessageReceived(0, type);
+        } else if (type === 'continue') r.context.handleMessageReceived(0, 'appendFinal');
+        else if (type === 'impersonate') r.context.handleImpersonateReady('  ');
+        r.context.handleGenerationEnded();
+        await r.advance(5000);
+        assert.equal(r.route(CUSTOM_KEY).errors, 1, type);
+        assert.equal(r.route(CUSTOM_KEY).ok, 0, type);
+        assert.equal(r.route(CUSTOM_KEY).lastError.code, 'empty_response', type);
+        assert.deepEqual(counts(r.today()), { messageCount: 0, stopped: 0, failed: 1 }, type);
+    }
+});
+
+test('a successful HTTP stream that ends without output cannot remain open forever', async () => {
+    const r = runtime();
+    const sp = startStreaming(r);
+    const s = streamed();
+    r.respond(s.response);
+    await r.send({ stream: true, body: CUSTOM });
+    s.write('data: [DONE]\n\n');
+    s.end();
+    await r.settle();
+    sp.isFinished = true;
+    r.context.handleGenerationEnded();
+    await r.advance(5000);
+    assert.equal(r.route(CUSTOM_KEY).lastError.code, 'no_response');
+    assert.equal(r.context.attemptTracker.openMain(), null);
+});
+
+test('a lifecycle stream error is replaced by a late detailed provider error without duplication', async () => {
+    const r = runtime();
+    const sp = startStreaming(r);
+    const s = streamed();
+    r.respond(s.response);
+    await r.send({ stream: true, body: CUSTOM });
+    sp.isStopped = true;
+    r.context.handleGenerationEnded();
+    await r.advance(180);
+    assert.equal(r.route(CUSTOM_KEY).lastError.code, 'stream_error');
+    const failureAt = r.route(CUSTOM_KEY).lastError.at;
+    s.write('data: {"error":{"message":"Invalid api_key=provider-secret","code":401,"metadata":{"provider_name":"upstream"}}}\n\n');
+    s.end();
+    await r.settle();
+    assert.equal(r.route(CUSTOM_KEY), undefined, 'remove the provisional route');
+    const route = r.route(`${CUSTOM_KEY}upstream`);
+    assert.equal(route.errors, 1);
+    assert.equal(route.lastError.kind, 'stream');
+    assert.equal(route.lastError.at, failureAt);
+    assert.ok(!JSON.stringify(r.settings.errorTracking).includes('provider-secret'));
+    assert.equal(r.settings.errorTracking.log.length, 1);
+    assert.equal(r.today().failed, 1);
+});
+
+test('tool-only responses are valid, including quiet responses and follow-up generations', async () => {
+    for (const type of ['normal', 'quiet']) {
+        const r = runtime();
+        r.context.handleGenerationStarted(type, {}, false);
+        r.context.handleGenerateAfterData({ prompt: [] }, false);
+        r.respond(ok({ choices: [{ message: { content: null, tool_calls: [{ id: 'call-1', function: { name: 'search' } }] } }] }));
+        await r.send({ body: CUSTOM });
+        await r.settle();
+        r.context.handleGenerationEnded();
+        await r.advance(5000);
+        assert.equal(r.settings.errorTracking.log.length, 0);
+        assert.equal(r.route(CUSTOM_KEY).ok, 1);
+        assert.equal(r.today().failed || 0, 0);
+    }
+});
+
+test('a stop after HTTP success suppresses no-response errors', async () => {
+    const r = runtime();
+    r.context.handleGenerationStarted('normal', {}, false);
+    r.context.handleGenerateAfterData({ prompt: [] }, false);
+    r.respond(ok({ choices: [] }));
+    await r.send({ body: CUSTOM });
+    await r.settle();
+    r.context.handleGenerationEnded();
+    r.context.handleGenerationStopped();
+    await r.advance(5000);
+    assert.equal(r.settings.errorTracking.log.length, 0);
+    assert.equal(r.today().stopped, 1);
+});
+
+test('late responses within the grace period succeed and unrelated extension messages do not', async () => {
+    for (const extensionMessage of [false, true]) {
+        const r = runtime();
+        r.context.handleGenerationStarted('normal', {}, false);
+        r.context.handleGenerateAfterData({ prompt: [] }, false);
+        r.respond(ok({ choices: [] }));
+        await r.send({ body: CUSTOM });
+        await r.settle();
+        r.context.handleGenerationEnded();
+        await r.advance(500);
+        r.chat.push({ mes: 'late reply' });
+        r.context.handleMessageReceived(0, extensionMessage ? 'extension' : 'normal');
+        await r.advance(5000);
+        assert.equal(r.settings.errorTracking.log.length, extensionMessage ? 1 : 0);
+    }
+});
+
+test('starting a new generation cannot hide the silent failure of the previous one', async () => {
+    const r = runtime();
+    r.context.handleGenerationStarted('normal', {}, false);
+    r.context.handleGenerateAfterData({ prompt: [] }, false);
+    r.respond(ok({ choices: [] }));
+    await r.send({ body: CUSTOM });
+    await r.settle();
+    r.context.handleGenerationEnded();
+    r.context.handleGenerationStarted('normal', {}, false);
+    r.context.handleGenerateAfterData({ prompt: [] }, false);
+    await r.advance(180);
+    assert.equal(r.route(CUSTOM_KEY).lastError.code, 'no_response');
+    assert.equal(r.today().failed, 1);
+});
+
+test('streaming tool-only responses do not create empty-output failures', async () => {
+    const r = runtime();
+    const sp = startStreaming(r);
+    const s = streamed();
+    r.respond(s.response);
+    await r.send({ stream: true, body: CUSTOM });
+    s.write('data: {"choices":[{"delta":{"tool_calls":[{"id":"call-1","function":{"name":"search"}}]}}]}\n\ndata: [DONE]\n\n');
+    s.end();
+    sp.isFinished = true;
+    await r.settle();
+    r.context.handleGenerationEnded();
+    await r.advance(5000);
+    assert.equal(r.settings.errorTracking.log.length, 0);
+    assert.equal(r.route(CUSTOM_KEY).ok, 1);
+    assert.equal(r.today().failed || 0, 0);
+});
+
+test('API errors reach the console only after credential scrubbing', async () => {
+    const r = runtime();
+    const warnings = [];
+    r.context.console.warn = value => warnings.push(value);
+    r.respond(new TypeError('Failed Authorization: Bearer console-secret'));
+    await assert.rejects(r.send({ body: CUSTOM }));
+    await r.settle();
+    assert.equal(warnings.length, 1);
+    assert.ok(!warnings[0].includes('console-secret'));
+    assert.ok(!JSON.stringify(r.settings.errorTracking).includes('console-secret'));
+});
 
 /** A streamed response whose body the test writes */
 function streamed() {

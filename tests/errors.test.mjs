@@ -156,3 +156,59 @@ test('stored values that are not a valid store are replaced', () => {
     assert.deepEqual(errors.normalizeErrorStore({ routes: [], log: [] }), { routes: {}, log: [] });
     assert.deepEqual(errors.normalizeErrorStore({ routes: {} }), { routes: {}, log: [] });
 });
+
+test('credentials are scrubbed in headers, JSON, diagnostics, URLs and recognizable tokens', () => {
+    const samples = [
+        ['Authorization: Bearer bearer-secret', 'bearer-secret'],
+        ['Basic dXNlcjpzZWNyZXQ=', 'dXNlcjpzZWNyZXQ='],
+        ['{"api_key":"json-secret with spaces", "message":"Bad key"}', 'json-secret'],
+        ["{'accessToken': 'quoted-secret'}", 'quoted-secret'],
+        ['api-key=field-secret password: another-secret', 'field-secret'],
+        ['https://user-secret:pass-secret@example.com/v1?unusual=opaque-secret#fragment-secret', 'secret'],
+        ['Cookie: session=cookie-secret; other=other-secret', 'secret'],
+        ['Set-Cookie: session=cookie-secret; Path=/; HttpOnly', 'cookie-secret'],
+        ['Invalid sk-ant-api03-provider-secret gsk_providersecret hf_providersecret', 'providersecret'],
+        ['eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature-secret', 'signature-secret'],
+    ];
+    for (const [sample, secret] of samples) {
+        const cleaned = errors.scrubCredentials(sample);
+        assert.ok(!cleaned.includes(secret), sample);
+        assert.ok(cleaned.includes('[REDACTED]'), sample);
+        assert.equal(errors.scrubCredentials(cleaned), cleaned, 'redaction is idempotent');
+    }
+    assert.equal(errors.describeError({ error: { message: 'Rate limited', metadata: {
+        raw: '{"api_key":"raw-provider-secret"}',
+    } } }).message.includes('raw-provider-secret'), false);
+    const clipped = errors.describeError(`api_key=${'x'.repeat(500)} trailing info`).message;
+    assert.ok(!clipped.includes('xxxxx'), 'redact before clipping');
+});
+
+test('new records and imported/old logs scrub messages, codes, grouping keys and route labels', () => {
+    const store = errors.createErrorStore();
+    const route = { source: 'custom', host: 'example.com', model: 'model', provider: '' };
+    errors.recordRouteOutcome(store, route, { kind: 'network', code: 'sk-code-secret',
+        message: 'API key: message-secret' });
+    assert.ok(!JSON.stringify(store).includes('secret'));
+    const oldRoute = { ...route, provider: 'api_key=old-secret' };
+    const entry = { at: 10, kind: 'response', code: 'sk-old-code', message: 'Authorization: Bearer old-secret' };
+    const imported = { routes: { [errors.routeKey(oldRoute)]: { ...oldRoute, ok: 1, errors: 2,
+        byLabel: { 'sk-old-code': 2 }, lastError: entry } }, log: [{ ...oldRoute, ...entry }] };
+    assert.equal(errors.normalizeErrorStore(imported), imported);
+    assert.ok(!JSON.stringify(imported).includes('old-secret'));
+    assert.ok(!JSON.stringify(imported).includes('sk-old-code'));
+    assert.equal(Object.values(imported.routes)[0].errors, 2);
+});
+
+test('retracting a fallback preserves other errors and never affects a cleared store', () => {
+    const store = errors.createErrorStore();
+    const route = { source: 'custom', host: '', model: 'm', provider: '' };
+    errors.recordRouteOutcome(store, route, { kind: 'generation', message: 'missing' }, { now: 1 });
+    const inferred = store.log[0];
+    errors.recordRouteOutcome(store, route, { kind: 'http', status: 429, message: 'limited' }, { now: 2 });
+    assert.equal(errors.retractRouteError(store, inferred), true);
+    const stats = store.routes[errors.routeKey(route)];
+    assert.equal(stats.errors, 1);
+    assert.deepEqual(stats.byLabel, { 429: 1 });
+    assert.equal(stats.lastError.message, 'limited');
+    assert.equal(errors.retractRouteError(errors.createErrorStore(), inferred), false);
+});

@@ -124,7 +124,7 @@ test('streaming success: end event before the message does not fail the attempt'
     const main = h.tracker.begin('main');
     h.tracker.bindRequest({ streaming: true });
     h.tracker.requestSettled(main, 'ok');
-    h.tracker.generationEnded({ streamError: false });
+    h.tracker.generationEnded({ streamError: false, streamHasOutput: true });
     h.advance(10_000);
     assert.equal(h.resolved.length, 0);
     assert.equal(h.tracker.resolve(h.tracker.openMain(), 'succeeded'), true);
@@ -137,7 +137,7 @@ test('streaming seen only at the end event is not failed by the grace check or p
     // request never matched, but a live stream was observed
     h.advance(60_000);
     h.tracker.markStreaming(main);
-    h.tracker.generationEnded();
+    h.tracker.generationEnded({ streamHasOutput: true });
     h.advance(10_000);
     assert.equal(h.resolved.length, 0);
     h.tracker.resolve(main, 'succeeded');

@@ -23,7 +23,7 @@ const PLAIN_BODY_LIMIT = 64 * 1024;
 
 /**
  * @typedef {object} RouteError
- * @property {string} kind 'http' | 'network' | 'response' | 'stream' | 'interrupted'
+ * @property {string} kind 'http' | 'network' | 'response' | 'stream' | 'interrupted' | 'generation'
  * @property {number} [status] HTTP status ('http' only)
  * @property {string} [code] Error code or type from the payload
  * @property {string} message
@@ -41,11 +41,93 @@ export function normalizeErrorStore(store) {
     const valid = store && typeof store === 'object'
         && store.routes && typeof store.routes === 'object' && !Array.isArray(store.routes)
         && Array.isArray(store.log);
-    return valid ? store : createErrorStore();
+    if (!valid) return createErrorStore();
+    // Scrub old records and imports too, including strings used as grouping keys.
+    const routes = Object.create(null);
+    for (const [oldKey, stats] of Object.entries(store.routes)) {
+        if (!stats || typeof stats !== 'object') continue;
+        const key = oldKey.split('|').map(clip).join('|');
+        const cleaned = scrubStoredRecord(stats);
+        if (stats.lastError) cleaned.lastError = scrubStoredRecord(stats.lastError);
+        if (stats.byLabel) {
+            cleaned.byLabel = {};
+            for (const [name, count] of Object.entries(stats.byLabel)) {
+                const safeName = clip(name);
+                Object.defineProperty(cleaned.byLabel, safeName, {
+                    value: (Number(cleaned.byLabel[safeName]) || 0) + (Number(count) || 0),
+                    writable: true, enumerable: true, configurable: true,
+                });
+            }
+        }
+        if (!routes[key]) {
+            routes[key] = cleaned;
+        } else {
+            const target = routes[key];
+            target.ok = (Number(target.ok) || 0) + (Number(cleaned.ok) || 0);
+            target.errors = (Number(target.errors) || 0) + (Number(cleaned.errors) || 0);
+            target.byLabel ||= {};
+            for (const [name, count] of Object.entries(cleaned.byLabel || {})) {
+                Object.defineProperty(target.byLabel, name, { value: (Number(target.byLabel[name]) || 0) + count,
+                    writable: true, enumerable: true, configurable: true });
+            }
+            target.lastSeenAt = Math.max(target.lastSeenAt || 0, cleaned.lastSeenAt || 0);
+            if (cleaned.lastError && (!target.lastError || cleaned.lastError.at >= target.lastError.at)) {
+                target.lastError = cleaned.lastError;
+            }
+        }
+    }
+    store.routes = routes;
+    store.log = store.log.filter(entry => entry && typeof entry === 'object').slice(-ERROR_LOG_LIMIT)
+        .map(scrubStoredRecord);
+    return store;
 }
 
 const text = (value) => typeof value === 'string' ? value.trim() : '';
 const label = (value) => typeof value === 'number' && Number.isFinite(value) ? String(value) : text(value);
+
+/** Redact credentials before clipping, persistence, console output or export. */
+export function scrubCredentials(value) {
+    let result = String(value ?? '');
+    result = result.replace(/\b((?:set-)?cookie\s*:\s*)[^\r\n]+/gi, '$1[REDACTED]');
+    // URLs can carry credentials in userinfo, arbitrary query names and fragments.
+    result = result.replace(/https?:\/\/[^\s<>"']+/gi, raw => {
+        try {
+            const url = new URL(raw);
+            const hadCredentials = Boolean(url.username || url.password);
+            url.username = '';
+            url.password = '';
+            if (url.search) url.search = '?[REDACTED]';
+            if (url.hash) url.hash = '#[REDACTED]';
+            return `${hadCredentials ? '[REDACTED]@' : ''}${url.href}`;
+        } catch {
+            return '[REDACTED URL]';
+        }
+    });
+    // Quoted JSON fields, headers and key=value diagnostics. Never keep a token prefix.
+    const field = '(?:authorization|proxy[-_ ]?authorization|(?:x[-_ ])?api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|auth[-_ ]?token|token|secret|client[-_ ]?secret|password|passwd|cookie|set-cookie)';
+    result = result.replace(new RegExp(`(["']?${field}["']?\\s*[:=]\\s*)(["'])(?:\\\\.|(?!\\2)[^\\\\])*?\\2`, 'gi'), '$1"[REDACTED]"');
+    result = result.replace(new RegExp(`(\\b${field}\\b\\s*[:=]\\s*)(?:Bearer\\s+|Basic\\s+)?[^\\s,;"'}]+`, 'gi'), '$1[REDACTED]');
+    result = result.replace(/\b(Bearer|Basic)\s+[^\s,;"'<>]+/gi, '$1 [REDACTED]');
+    result = result.replace(/\b(?:sk-[\w-]+|gsk_[\w-]+|hf_[\w-]+|AIza[\w-]{20,}|eyJ[\w-]+\.[\w-]+\.[\w-]+)\b/g, '[REDACTED]');
+    return result;
+}
+
+function cleanRoute(route) {
+    return Object.fromEntries(['source', 'host', 'model', 'provider'].map(key => [key, clip(route[key] || '')]));
+}
+
+function scrubStoredRecord(record) {
+    const cleaned = { ...record };
+    for (const field of ['source', 'host', 'model', 'provider', 'kind', 'code', 'message', 'genType']) {
+        if (typeof cleaned[field] === 'string') cleaned[field] = clip(cleaned[field]);
+    }
+    return cleaned;
+}
+
+function cleanErrorEntry(entry) {
+    return { at: entry.at, kind: clip(entry.kind || ''), status: entry.status ?? null,
+        code: clip(entry.code || ''), message: clip(entry.message || 'Unknown error') };
+}
 
 /**
  * Host of an endpoint URL. Never the user info, path or query, which can hold API keys.
@@ -124,13 +206,23 @@ export function payloadProvider(data) {
     return text(data.provider) || text(data.error?.metadata?.provider_name);
 }
 
+/** Tool-only completions are valid even when they contain no assistant text. */
+export function payloadHasToolCalls(data) {
+    return Boolean((Array.isArray(data?.choices) && data.choices.some(choice => choice?.message?.tool_calls?.length
+        || choice?.message?.function_call || choice?.delta?.tool_calls?.length || choice?.delta?.function_call))
+        || data?.content_block?.type === 'tool_use'
+        || (Array.isArray(data?.content) && data.content.some(block => block?.type === 'tool_use'))
+        || (Array.isArray(data?.candidates) && data.candidates.some(candidate =>
+            Array.isArray(candidate?.content?.parts) && candidate.content.parts.some(part => part?.functionCall))));
+}
+
 /**
  * Collapse whitespace, drop HTML tags and shorten a message
  * @param {string} message
  * @returns {string}
  */
 function clip(message) {
-    let result = String(message);
+    let result = scrubCredentials(message);
     if (/<\/?[a-z][^>]*>/i.test(result)) result = result.replace(/<[^>]*>/g, ' ');
     result = result.replace(/\s+/g, ' ').trim();
     return result.length > MESSAGE_LIMIT ? `${result.slice(0, MESSAGE_LIMIT - 1)}…` : result;
@@ -157,7 +249,7 @@ export function describeError(data, fallback = '') {
     const raw = text(error?.metadata?.raw);
     if (raw && !message.includes(raw)) message = `${message}: ${raw}`;
     const code = label(error?.code) || text(error?.type) || label(data?.code);
-    return { message: clip(message), code };
+    return { message: clip(message), code: clip(code) };
 }
 
 /** HTTP reason phrases, by lower-cased phrase */
@@ -201,6 +293,7 @@ export function createStreamScanner() {
     let events = 0;
     let plain = '';
     let provider = '';
+    let hasToolCalls = false;
 
     function dispatch(errors) {
         if (!dataLines.length) return;
@@ -217,6 +310,7 @@ export function createStreamScanner() {
             return;
         }
         provider ||= payloadProvider(data);
+        hasToolCalls ||= payloadHasToolCalls(data);
         const error = payloadError(data);
         if (error) errors.push(error);
     }
@@ -271,6 +365,9 @@ export function createStreamScanner() {
         get provider() {
             return provider;
         },
+        get hasToolCalls() {
+            return hasToolCalls;
+        },
     };
 }
 
@@ -311,6 +408,7 @@ function pruneRoutes(store, keepKey) {
  * @returns {object} The route's stats
  */
 export function recordRouteOutcome(store, route, error, { now = Date.now(), genType = '' } = {}) {
+    route = cleanRoute(route);
     const key = routeKey(route);
     let stats = store.routes[key];
     if (!stats) {
@@ -325,20 +423,34 @@ export function recordRouteOutcome(store, route, error, { now = Date.now(), genT
     }
 
     const entry = {
+        ...cleanErrorEntry(error),
         at: now,
-        kind: error.kind,
-        status: error.status ?? null,
-        code: error.code || '',
-        message: clip(error.message || 'Unknown error'),
     };
-    const errorKey = errorLabel(error);
+    const errorKey = errorLabel(entry);
     stats.errors++;
-    stats.byLabel[errorKey] = (stats.byLabel[errorKey] || 0) + 1;
+    Object.defineProperty(stats.byLabel, errorKey, { value: (Number(stats.byLabel[errorKey]) || 0) + 1,
+        writable: true, enumerable: true, configurable: true });
     stats.lastError = entry;
 
-    store.log.push({ ...route, ...entry, genType });
+    store.log.push({ ...route, ...entry, genType: clip(genType) });
     if (store.log.length > ERROR_LOG_LIMIT) store.log.splice(0, store.log.length - ERROR_LOG_LIMIT);
     return stats;
+}
+
+/** Replace a provisional lifecycle error with the detailed error for the same request. */
+export function retractRouteError(store, logEntry) {
+    const index = store.log.indexOf(logEntry);
+    if (index === -1) return false; // Cleared/imported/pruned records must not affect new counts.
+    store.log.splice(index, 1);
+    const stats = store.routes[routeKey(logEntry)];
+    if (!stats) return true;
+    stats.errors = Math.max(0, stats.errors - 1);
+    const name = errorLabel(logEntry);
+    if (stats.byLabel[name] > 1) stats.byLabel[name]--;
+    else delete stats.byLabel[name];
+    stats.lastError = store.log.slice().reverse().find(entry => routeKey(entry) === routeKey(logEntry)) || null;
+    if (!stats.ok && !stats.errors) delete store.routes[routeKey(logEntry)];
+    return true;
 }
 
 /**

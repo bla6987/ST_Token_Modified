@@ -19,7 +19,7 @@ import { getChatCompletionModel, oai_settings } from '../../../openai.js';
 import { textgenerationwebui_settings as textgen_settings } from '../../../textgen-settings.js';
 import { parsePrice, configuredPrice, collectPriceGroups, saveSharedPrice, readPricingSnapshot, matchingPriceModels, applyMatchingPrices } from './pricing.js';
 import { bumpCounts, generationStats, generationPoint, hasCompleteOutcomes, countAxisScale, createAttemptTracker } from './metrics.js';
-import { createErrorStore, normalizeErrorStore, routeFromRequest, payloadError, payloadProvider, describeError, statusFromReason, createStreamScanner, recordRouteOutcome, erroringRoutes, errorBreakdown, errorLabel } from './errors.js';
+import { createErrorStore, normalizeErrorStore, routeFromRequest, payloadError, payloadProvider, payloadHasToolCalls, describeError, scrubCredentials, statusFromReason, createStreamScanner, recordRouteOutcome, retractRouteError, erroringRoutes, errorBreakdown, errorLabel } from './errors.js';
 
 const extensionName = 'token-usage-tracker';
 
@@ -346,6 +346,26 @@ function getCurrentSourceId() {
         return oai_settings.chat_completion_source;
     }
     return main_api || 'unknown';
+}
+
+/** Capture only route labels, never settings containing prompts or credentials. */
+function snapshotGenerationRoute(modelId, sourceId) {
+    if (main_api === 'openai') {
+        return routeFromRequest('/api/backends/chat-completions/generate', {
+            chat_completion_source: sourceId, model: modelId,
+            custom_url: sourceId === 'custom' ? oai_settings?.custom_url : '',
+            reverse_proxy: ['openai', 'claude', 'mistralai', 'makersuite', 'vertexai', 'deepseek', 'xai', 'zai', 'moonshot'].includes(sourceId)
+                ? oai_settings?.reverse_proxy : '',
+            azure_base_url: sourceId === 'azure_openai' ? oai_settings?.azure_base_url : '',
+        });
+    }
+    if (main_api === 'textgenerationwebui') {
+        return routeFromRequest('/api/backends/text-completions/generate', {
+            api_type: textgen_settings?.type || sourceId, model: modelId,
+            api_server: textgen_settings?.server_urls?.[textgen_settings.type],
+        });
+    }
+    return { source: sourceId, model: modelId, host: '', provider: '' };
 }
 
 // OpenRouter pricing cache duration (24 hours in ms)
@@ -845,7 +865,16 @@ function handleGenerationStarted(type, params, isDryRun) {
         }
     }
 
-    pendingGenerationStart = { type, preContinuePromise };
+    const previous = type === 'continue' ? getContext().chat?.at(-1) : null;
+    pendingGenerationStart = { type, preContinuePromise, preContinueText: previous?.mes || '',
+        preContinueReasoning: previous?.extra?.reasoning || '', modelId: getCurrentModelId(), sourceId: getCurrentSourceId(),
+        chatId: getCurrentChatId(), armed: !event_types.GENERATION_AFTER_COMMANDS };
+    pendingGenerationStart.fallbackRoute = snapshotGenerationRoute(pendingGenerationStart.modelId, pendingGenerationStart.sourceId);
+}
+
+/** Like Chat Manager, arm only after slash commands have allowed a real generation. */
+function handleGenerationAfterCommands(type, _params, dryRun) {
+    if (!dryRun && pendingGenerationStart?.type === type) pendingGenerationStart.armed = true;
 }
 
 /**
@@ -875,7 +904,7 @@ function handleGenerateAfterData(generate_data, dryRun) {
             return 0;
         });
 
-    attemptTracker.begin(kind, {
+    const attempt = attemptTracker.begin(kind, {
         genType,
         modelId,
         sourceId,
@@ -883,7 +912,11 @@ function handleGenerateAfterData(generate_data, dryRun) {
         chatId: kind === 'quiet' ? null : getCurrentChatId(),
         inputTokensPromise,
         preContinuePromise: start?.preContinuePromise || null,
+        preContinueText: start?.preContinueText,
+        preContinueReasoning: start?.preContinueReasoning,
     });
+    // The request route overrides this snapshot; never look up the selected API after failure.
+    attempt.meta.fallbackRoute = snapshotGenerationRoute(modelId, sourceId);
 }
 
 /**
@@ -893,7 +926,7 @@ function handleGenerateAfterData(generate_data, dryRun) {
  */
 function handleMessageReceived(messageIndex, type) {
     // Filter out events that don't correspond to actual API calls
-    const nonApiTypes = ['command', 'first_message'];
+    const nonApiTypes = ['command', 'first_message', 'extension'];
     if (nonApiTypes.includes(type)) {
         console.log(`[Token Usage Tracker] Skipping non-API message type: ${type}`);
         return;
@@ -907,7 +940,11 @@ function handleMessageReceived(messageIndex, type) {
     }
 
     const message = getContext().chat?.[messageIndex] || null;
-    attemptTracker.resolve(attempt, 'succeeded', { message, type });
+    let hasOutput = Boolean(message?.mes?.trim() || message?.extra?.reasoning?.trim()
+        || message?.extra?.tool_invocations?.length);
+    if (attempt.meta.genType === 'continue' && message?.mes === attempt.meta.preContinueText
+        && (message?.extra?.reasoning || '') === attempt.meta.preContinueReasoning) hasOutput = false;
+    attemptTracker.resolve(attempt, hasOutput ? 'succeeded' : 'failed', { message, type, failureCode: 'empty_response' });
 }
 
 /**
@@ -917,7 +954,9 @@ function handleMessageReceived(messageIndex, type) {
 function handleImpersonateReady(text) {
     const attempt = attemptTracker.openMain();
     if (!attempt) return;
-    attemptTracker.resolve(attempt, 'succeeded', { text: typeof text === 'string' ? text : '' });
+    attemptTracker.resolve(attempt, text?.trim() ? 'succeeded' : 'failed', {
+        text: typeof text === 'string' ? text : '', failureCode: 'empty_response',
+    });
 }
 
 /**
@@ -941,7 +980,16 @@ function handleGenerationStopped() {
  * Handle generation ended event (fires when the stop button hides: on success, error and stop)
  */
 function handleGenerationEnded() {
-    const attempt = attemptTracker.openMain();
+    let attempt = attemptTracker.openMain();
+    // Failures before prompt construction have no GENERATE_AFTER_DATA/request event.
+    // Capture only armed foreground attempts; commands and dry runs stay silent.
+    const start = pendingGenerationStart;
+    if (!attempt && start?.armed && start.type !== 'quiet') {
+        pendingGenerationStart = null;
+        attempt = attemptTracker.begin('main', { genType: start.type, modelId: start.modelId,
+            sourceId: start.sourceId, chatId: start.chatId,
+            fallbackRoute: start.fallbackRoute });
+    }
     // A live, non-errored processor means this generation streamed even if its request did not say so.
     // (SillyTavern clears the processor after every stream except one that errored.)
     if (attempt && !attempt.meta.streamingProcessor && streamingProcessor && !streamingProcessor.isStopped) {
@@ -949,9 +997,12 @@ function handleGenerationEnded() {
         attemptTracker.markStreaming(attempt);
     }
     const sp = attempt?.meta.streamingProcessor;
+    if (attempt) attempt.meta.endedAt ||= getCurrentEasternTime().getTime();
     // onErrorStreaming sets isStopped; a user stop sets isFinished instead
     const streamError = Boolean(sp && sp.isStopped === true && sp.isFinished !== true);
-    attemptTracker.generationEnded({ streamError });
+    const streamHasOutput = Boolean(sp?.result?.trim() || sp?.reasoningHandler?.reasoning?.trim()
+        || sp?.toolCalls?.length || attempt?.meta.hasToolCalls);
+    attemptTracker.generationEnded({ streamError, streamHasOutput });
 }
 
 /**
@@ -970,10 +1021,34 @@ function handleChatChanged(chatId) {
  * @param {object} details
  */
 function handleAttemptResolved(attempt, status, details) {
+    const observation = attempt.meta.requestObservation;
+    if (status === 'failed') {
+        attempt.meta.failedAt = attempt.meta.endedAt ?? getCurrentEasternTime().getTime();
+        attempt.meta.failureCode = details.failureCode || 'no_response';
+        // Give the cloned response a chance to provide a detailed error. The manual-stop
+        // grace check and streaming-state distinction come from Chat Manager's detector.
+        window.setTimeout(() => recordInferredFailure(attempt), 180);
+    } else if (observation?.responseReady) {
+        recordRouteResult(observation, null, observation.provider);
+    }
     attempt.recording = recordAttempt(attempt, status, details).catch(error => {
         console.error('[Token Usage Tracker] Error recording generation:', error);
         recordHealthError(error?.message || String(error));
     });
+}
+
+/** Log a lifecycle failure even when the server returned no error payload. */
+function recordInferredFailure(attempt) {
+    if (attempt.status !== 'failed') return;
+    const observation = attempt.meta.requestObservation ||= {
+        attempt, route: attempt.meta.fallbackRoute, genType: attempt.meta.genType,
+    };
+    if (!observation.route || observation.recorded) return;
+    const code = attempt.meta.failureCode || 'no_response';
+    const message = code === 'stream_error' ? 'SillyTavern could not finish reading the generation stream'
+        : code === 'empty_response' ? 'Generation returned an empty response'
+            : 'Generation ended without a response';
+    recordRouteResult(observation, { kind: 'generation', code, message }, observation.provider, true);
 }
 
 /**
@@ -4381,7 +4456,10 @@ function observeGenerationRequest(input, init) {
     }
     const route = routeFromRequest(path, body);
     if (!attempt && !route) return null;
-    return { attempt, route, streaming, signal, genType: attempt?.meta.genType || '' };
+    const observation = { attempt, route: route || attempt?.meta.fallbackRoute, streaming, signal,
+        genType: attempt?.meta.genType || '' };
+    if (attempt) attempt.meta.requestObservation = observation;
+    return observation;
 }
 
 /**
@@ -4459,14 +4537,21 @@ async function inspectResponse(observation, response) {
     }
 
     const error = payloadError(data);
+    if (attempt) attempt.meta.hasToolCalls = payloadHasToolCalls(data);
     if (route) {
         const routeError = error && { kind: 'response', status: statusFromReason(error.message), ...error };
         recordRouteResult(observation, routeError, payloadProvider(data));
     }
     if (error) {
         attemptTracker.resolve(attempt, 'failed');
-    } else if (attempt?.kind === 'quiet') {
+    } else if (attempt?.meta.hasToolCalls) {
+        // Tool-only rounds are valid responses and can start a follow-up generation.
         attemptTracker.resolve(attempt, 'succeeded', { responseData: data });
+    } else if (attempt?.kind === 'quiet') {
+        const hasOutput = Boolean(extractResponseText(data)?.trim() || (await extractResponseReasoning(data))?.trim());
+        attemptTracker.resolve(attempt, hasOutput ? 'succeeded' : 'failed', {
+            responseData: data, failureCode: 'empty_response',
+        });
     }
 }
 
@@ -4528,8 +4613,15 @@ async function watchStreamedResponse(observation, response) {
     // Stop buffering the rest of this copy of the stream
     if (error) reader.cancel().catch(() => {});
 
+    if (observation.attempt) observation.attempt.meta.hasToolCalls ||= scanner.hasToolCalls;
     recordRouteResult(observation, error, scanner.provider);
     if (error) attemptTracker.resolve(observation.attempt, 'failed');
+    else if (scanner.hasToolCalls) {
+        const sp = observation.attempt?.meta.streamingProcessor;
+        attemptTracker.resolve(observation.attempt, 'succeeded', {
+            text: sp?.result || '', reasoning: sp?.reasoningHandler?.reasoning || '',
+        });
+    }
 }
 
 /**
@@ -4538,14 +4630,29 @@ async function watchStreamedResponse(observation, response) {
  * @param {object|null} error null for success
  * @param {string} [provider] Upstream provider named by the response
  */
-function recordRouteResult({ route, genType }, error, provider = '') {
-    recordRouteOutcome(getSettings().errorTracking, provider ? { ...route, provider } : route, error, {
-        now: getCurrentEasternTime().getTime(),
-        genType: genType || '',
+function recordRouteResult(observation, error, provider = '', inferred = false) {
+    const { route, genType, attempt } = observation;
+    if (!route) return;
+    observation.provider = provider || observation.provider || '';
+    if (!error) {
+        observation.responseReady = true;
+        if (attempt?.status === 'open' || attempt?.status === 'failed') return;
+    }
+    const store = getSettings().errorTracking;
+    if (observation.recorded) {
+        // A late detailed error replaces the fallback, retaining the original failure time.
+        if (!error || inferred || !observation.inferred) return;
+        if (!retractRouteError(store, observation.recorded)) return;
+    }
+    const now = attempt?.meta.failedAt ?? observation.recorded?.at ?? getCurrentEasternTime().getTime();
+    const stats = recordRouteOutcome(store, observation.provider ? { ...route, provider: observation.provider } : route, error, {
+        now, genType: genType || '',
     });
+    observation.recorded = error ? store.log.at(-1) : true;
+    observation.inferred = inferred;
     saveSettings();
     if (error) {
-        console.warn(`[Token Usage Tracker] API error (${errorLabel(error)}) from ${route.model} via ${route.source}${route.host ? ` @ ${route.host}` : ''}: ${error.message}`);
+        console.warn(`[Token Usage Tracker] API error (${errorLabel(stats.lastError)}) from ${scrubCredentials(route.model)} via ${scrubCredentials(route.source)}${route.host ? ` @ ${scrubCredentials(route.host)}` : ''}: ${stats.lastError.message}`);
     }
     scheduleErrorPanelRender();
 }
@@ -4639,6 +4746,7 @@ jQuery(async () => {
     console.log('[Token Usage Tracker] Initializing...');
 
     loadSettings();
+    saveSettings(); // Persist credential scrubbing of previously saved error records.
     registerSlashCommands();
     createSettingsUI();
 
@@ -4659,6 +4767,9 @@ jQuery(async () => {
 
     // Subscribe to events
     eventSource.on(event_types.GENERATION_STARTED, handleGenerationStarted);
+    if (event_types.GENERATION_AFTER_COMMANDS) {
+        eventSource.on(event_types.GENERATION_AFTER_COMMANDS, handleGenerationAfterCommands);
+    }
     eventSource.on(event_types.GENERATE_AFTER_DATA, handleGenerateAfterData);
     eventSource.on(event_types.MESSAGE_RECEIVED, handleMessageReceived);
     eventSource.on(event_types.GENERATION_STOPPED, handleGenerationStopped);
