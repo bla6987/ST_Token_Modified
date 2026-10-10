@@ -67,6 +67,8 @@ Once installed, the extension will automatically start tracking token usage. The
 
 - Use `/tokenmini` to toggle the compact miniview
 - Use `/tokenchat` to view current chat statistics
+- Use `/tokencsv` to download usage metrics as CSV. Filter by `scope`: daily, hourly, chat, model and source rows overlap and must not be summed together. Blank fields were not recorded; stopped/failed counters only cover history since `outcomes_tracked_since`. Costs are estimates using your current pricing, including shared rates and overrides. Blank reasoning values mean that scope did not record reasoning separately.
+- Keep using `/tokenexport` and `/tokenimport` for complete, restorable JSON backups, including API errors and pricing. CSV export never migrates or modifies history.
 - Use `/tokenerrors` to list API errors by source, endpoint, model and provider
 
 ### Shared model pricing

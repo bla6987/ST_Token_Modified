@@ -21,6 +21,8 @@ import { parsePrice, configuredPrice, collectPriceGroups, saveSharedPrice, readP
 import { bumpCounts, generationStats, generationPoint, hasCompleteOutcomes, countAxisScale, createAttemptTracker } from './metrics.js';
 import { createErrorStore, normalizeErrorStore, routeFromRequest, payloadError, payloadProvider, payloadHasToolCalls, describeError, scrubCredentials, statusFromReason, createStreamScanner, recordRouteOutcome, retractRouteError, erroringRoutes, errorBreakdown, errorLabel } from './errors.js';
 
+import { buildUsageCsv } from './usage-csv.js';
+
 const extensionName = 'token-usage-tracker';
 
 const EASTERN_TIMEZONE = 'America/New_York';
@@ -1296,6 +1298,25 @@ function registerSlashCommands() {
         },
         returns: 'Export confirmation',
         helpString: 'Exports all token usage data as a JSON file.',
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'tokencsv',
+        callback: async () => {
+            const csv = buildUsageCsv(getSettings().usage, calculateCost);
+            const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }));
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `token-usage-${getDayKey()}.csv`;
+            document.body.appendChild(link);
+            try { link.click(); } finally {
+                link.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+            }
+            return 'Usage CSV exported. Filter by scope; rows from different scopes overlap. Use /tokenexport for a restorable backup.';
+        },
+        returns: 'CSV export confirmation',
+        helpString: 'Exports usage metrics as CSV, retaining hourly, per-chat, model and source views. JSON backups remain available through /tokenexport.',
     }));
 
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
