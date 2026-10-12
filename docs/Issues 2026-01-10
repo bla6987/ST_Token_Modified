@@ -1,4 +1,9 @@
-Issues 2026-01-10
-- There is no 1D view to see only the usage for today in the chart
-- When switching to hourly view the bar chart displays only clear with no coloring
-- Track thinking vs response tokens
+Issues originally noted 2026-01-10 — reviewed 2026-10-12
+
+All three items have implementations in the current extension:
+
+[x] 1D chart view for today's usage — the 1D range control is present.
+[x] Hourly chart colors — hourly points retain model/source breakdowns and use the shared chart renderer and model colors.
+[x] Track thinking versus response tokens — reasoning is counted and stored separately in usage buckets and displayed in the miniview/today statistics.
+
+No remaining implementation task from this list. This is a source review, not a new live visual test.

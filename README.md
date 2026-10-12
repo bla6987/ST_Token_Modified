@@ -54,7 +54,9 @@ A SillyTavern extension that tracks and visualizes token usage and price for you
 
 ### Time Synchronization
 - External time sync with worldtimeapi.org for Eastern timezone
-- 5-minute auto-resync interval for time drift correction
+- Startup waits up to 3 seconds for the first sync before initializing usage timestamps, then falls back to the local clock if needed
+- Shared background refresh requests, throttled to one attempt per 5 minutes after success or failure
+- Precise datetime samples with request-midpoint correction; a failed refresh retains the last good offset
 - Timezone-aware date operations using Intl.DateTimeFormat
 
 ### Code Improvements

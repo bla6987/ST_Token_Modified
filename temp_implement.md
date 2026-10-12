@@ -1,33 +1,29 @@
-1. Session data persists across page reloads (Most likely unexpected)
-At index.js:192-194, the "session" usage data is stored in extension_settings and only resets if startTime is null. This means your "session" tokens survive browser refreshes and even browser restarts. Most users would expect "session" to reset when they close/reload the page.
+# Reliability review
 
-2. Race condition with "continue" generations
-At index.js:775-805, when you use "continue" to extend a message, the pre-continue token count is calculated asynchronously without waiting:
+Reviewed against local source on 2026-10-12. This file originally listed six suspected issues with references to an older `index.js`; those line numbers are obsolete.
 
+| Original concern | Current status | Implementation evidence |
+|---|---|---|
+| Session persisted across page reloads | **Implemented** | `loadSettings()` resets session usage and `startTime` on page load. |
+| Continue token-count race | **Implemented** | `handleGenerationStarted()` captures `preContinuePromise`; `countMessageOutput()` awaits it before subtracting prior tokens. |
+| Non-standard week numbering | **Implemented** | `getWeekKey()` uses ISO week numbering and the Thursday's year at year boundaries. |
+| Import could double statistics | **Implemented** | `importUsageData()` overwrites matching bucket entries rather than adding their counts. Other existing buckets remain; this is an idempotent merge, not deletion of all existing history. |
+| Session reset omitted reasoning | **Implemented** | `resetSession()` and startup reset explicitly set `reasoning: 0`. |
+| Startup external time sync was fire-and-forget | **Implemented on 2026-10-12** | Initialization awaits the bounded clock sync before creating session/tracking timestamps. `time.js` shares one request, throttles successes and failures for five minutes, retains the last good offset, and falls back to local time after a three-second request timeout. |
 
-(async () => {
-    // ... calculates preContinueTokenCount
-})();
-If the async function hasn't finished when handleMessageReceived runs, preContinueTokenCount will be 0, causing the entire continued message to be counted as new tokens instead of just the delta.
+## Time-sync findings and resolution
 
-3. Week number calculation is non-standard
-At index.js:232-240, the week key calculation doesn't follow ISO 8601. It can produce incorrect week numbers, especially around year boundaries (e.g., Dec 31 might show as week 53 or week 1 depending on the day).
+The old timestamp getter started a new sync on every read until a successful request finished. Failures never updated its retry timestamp, so offline or rate-limited clients could repeatedly request time. Overlapping responses could overwrite each other's offsets. It also preferred whole-second `unixtime` and subtracted arrival time, introducing avoidable rounding and request-latency error.
 
-4. Import data merges instead of replacing - can double your stats
-At index.js:1419-1431, importing data adds to existing days rather than replacing. If you export your data and import it again, all your token counts will be doubled.
+- [x] Share an in-flight sync across initialization and timestamp reads.
+- [x] Complete or time out the initial sync before initializing usage timestamps.
+- [x] Limit refresh attempts to one per five minutes after either success or failure, measured with a monotonic clock.
+- [x] Retain the last successful correction when a later refresh fails; use local time if none has succeeded.
+- [x] Prefer precise `datetime` and estimate correction against the request midpoint; retain `unixtime` fallback.
+- [x] Cover startup near Eastern midnight, concurrent reads, failed retries, refresh failure, malformed/HTTP responses, fallback parsing, synchronous fetch errors and timeout in `tests/time.test.mjs`.
 
-5. Missing reasoning field in session reset
-At index.js:526-533, the reset object is:
+## Remaining validation
 
+- [ ] Exercise startup and a later refresh in a live SillyTavern browser, including an unavailable time service.
 
-settings.usage.session = {
-    input: 0,
-    output: 0,
-    total: 0,  // missing reasoning: 0
-    messageCount: 0,
-    startTime: ...
-};
-But reasoning tokens are tracked elsewhere. After reset, the old reasoning value could persist.
-
-6. External time sync is non-blocking on startup
-At index.js:3485-3491, time sync is fire-and-forget. Early token recordings before sync completes will use local time, while later ones use external time - this can cause timestamps to be inconsistent within the same session.
+The correction is an estimate from an HTTP time sample, not a precision time protocol. Later successful refreshes can still correct the clock; previously stored history is not re-bucketed. No migration of existing usage data is part of this fix.

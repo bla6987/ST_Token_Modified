@@ -22,13 +22,12 @@ import { bumpCounts, generationStats, generationPoint, hasCompleteOutcomes, coun
 import { createErrorStore, normalizeErrorStore, routeFromRequest, payloadError, payloadProvider, payloadHasToolCalls, describeError, scrubCredentials, statusFromReason, createStreamScanner, recordRouteOutcome, retractRouteError, erroringRoutes, errorBreakdown, errorLabel } from './errors.js';
 
 import { buildUsageCsv } from './usage-csv.js';
+import { createUsageClock } from './time.js';
 
 const extensionName = 'token-usage-tracker';
 
 const EASTERN_TIMEZONE = 'America/New_York';
-let externalTimeOffset = null; // Offset between local time and external time (in ms)
-let lastTimeSyncTimestamp = null;
-const TIME_SYNC_INTERVAL = 5 * 60 * 1000; // Re-sync every 5 minutes
+const usageClock = createUsageClock({ timeZone: EASTERN_TIMEZONE });
 
 // Cached Intl.DateTimeFormat instances (avoid re-creating in hot loops)
 const _fmtDayDisplay = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, month: 'short', day: 'numeric' });
@@ -57,72 +56,9 @@ function getEasternParts(date) {
     };
 }
 
-/**
- * Fetch current time from external source (worldtimeapi.org)
- * @returns {Promise<Date|null>} Date object with external time, or null on failure
- */
-async function fetchExternalTime() {
-    try {
-        const response = await fetch(`https://worldtimeapi.org/api/timezone/${EASTERN_TIMEZONE}`, {
-            signal: AbortSignal.timeout(3000),
-        });
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-        const data = await response.json();
-        const externalDate = (typeof data?.unixtime === 'number')
-            ? new Date(data.unixtime * 1000)
-            : new Date(data?.datetime);
-        if (Number.isNaN(externalDate.getTime())) {
-            throw new Error('Invalid datetime from external time source');
-        }
-        return externalDate;
-    } catch (error) {
-        console.warn('[Token Usage Tracker] Failed to fetch external time:', error.message);
-        return null;
-    }
-}
-
-/**
- * Sync time offset with external source
- * Calculates the difference between local system time and external time
- */
-async function syncTimeOffset() {
-    const externalTime = await fetchExternalTime();
-    if (externalTime) {
-        const localTime = new Date();
-        const offset = externalTime.getTime() - localTime.getTime();
-        if (!Number.isFinite(offset)) {
-            console.warn('[Token Usage Tracker] External time offset is not finite');
-            return false;
-        }
-        externalTimeOffset = offset;
-        lastTimeSyncTimestamp = Date.now();
-        console.log(`[Token Usage Tracker] Time synced with external source. Offset: ${externalTimeOffset}ms`);
-        return true;
-    }
-    return false;
-}
-
-/**
- * Get current time in Eastern timezone, using external source when available
- * Falls back to local time converted to Eastern if external sync fails
- * @returns {Date} Date object representing current Eastern time
- */
+/** Current absolute time; Eastern timezone is applied by Intl formatting and bucket keys. */
 function getCurrentEasternTime() {
-    // Check if we need to re-sync (async, non-blocking)
-    if (!lastTimeSyncTimestamp || (Date.now() - lastTimeSyncTimestamp > TIME_SYNC_INTERVAL)) {
-        syncTimeOffset(); // Fire and forget - don't await
-    }
-
-    // NOTE: A JS Date is always an absolute timestamp (ms since epoch).
-    // We apply external offset (if available) to correct the timestamp.
-    // Eastern timezone handling is done when formatting/deriving parts via Intl.
-    if (externalTimeOffset !== null && Number.isFinite(externalTimeOffset)) {
-        return new Date(Date.now() + externalTimeOffset);
-    }
-
-    return new Date();
+    return usageClock.now();
 }
 
 const defaultSettings = {
@@ -4766,19 +4702,14 @@ function tryPatchSendRequest() {
 jQuery(async () => {
     console.log('[Token Usage Tracker] Initializing...');
 
+    // Establish the clock before session/tracking timestamps. Failure falls back locally
+    // after at most three seconds; later refreshes share one throttled background request.
+    await usageClock.sync();
+
     loadSettings();
     saveSettings(); // Persist credential scrubbing of previously saved error records.
     registerSlashCommands();
     createSettingsUI();
-
-    // Sync time with external source in background (non-blocking so UI appears immediately)
-    syncTimeOffset().then((success) => {
-        if (success) {
-            console.log('[Token Usage Tracker] External time sync successful');
-        } else {
-            console.log('[Token Usage Tracker] Using local time with Eastern timezone conversion');
-        }
-    });
 
     // Auto-fetch OpenRouter pricing if using OpenRouter API
     maybeAutoFetchOpenRouterPricing();
