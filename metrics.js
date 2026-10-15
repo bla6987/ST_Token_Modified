@@ -23,9 +23,10 @@ export function bumpCounts(entry, { messageCount = 0, stopped = 0, failed = 0 } 
  * @returns {{generations: number, stopped: number, failed: number, succeeded: number, attempts: number, successRate: number|null}}
  */
 export function generationStats(entry) {
-    const generations = entry?.messageCount || 0;
-    const stopped = entry?.stopped || 0;
-    const failed = entry?.failed || 0;
+    // Coerced: stored values are rendered as HTML
+    const generations = Number(entry?.messageCount) || 0;
+    const stopped = Number(entry?.stopped) || 0;
+    const failed = Number(entry?.failed) || 0;
     const attempts = generations + failed;
     const succeeded = Math.max(0, generations - stopped);
     return {

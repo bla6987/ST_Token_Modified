@@ -48,6 +48,8 @@ export function normalizeErrorStore(store) {
         if (!stats || typeof stats !== 'object') continue;
         const key = oldKey.split('|').map(clip).join('|');
         const cleaned = scrubStoredRecord(stats);
+        cleaned.ok = Number(cleaned.ok) || 0;
+        cleaned.errors = Number(cleaned.errors) || 0;
         if (stats.lastError) cleaned.lastError = scrubStoredRecord(stats.lastError);
         if (stats.byLabel) {
             cleaned.byLabel = {};
@@ -462,8 +464,10 @@ export function erroringRoutes(store) {
     return Object.entries(store?.routes || {})
         .filter(([, stats]) => stats?.errors > 0)
         .map(([key, stats]) => {
-            const attempts = (stats.ok || 0) + stats.errors;
-            return { ...stats, key, attempts, errorRate: stats.errors / attempts };
+            // Numeric: counts are rendered as HTML
+            const errors = Number(stats.errors);
+            const attempts = (Number(stats.ok) || 0) + errors;
+            return { ...stats, key, errors, attempts, errorRate: errors / attempts };
         })
         .sort((a, b) => b.errors - a.errors || (b.lastError?.at || 0) - (a.lastError?.at || 0));
 }

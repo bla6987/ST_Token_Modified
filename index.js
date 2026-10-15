@@ -1360,6 +1360,9 @@ window['TokenUsageTracker'] = {
  * Format token count with K/M suffix
  */
 function formatTokens(count) {
+    // Always a number: stored and imported counts are rendered as HTML
+    count = Number(count);
+    if (!Number.isFinite(count)) count = 0;
     if (count >= 1000000) return (count / 1000000).toFixed(1) + 'M';
     if (count >= 1000) return (count / 1000).toFixed(1) + 'K';
     return count.toString();
@@ -1388,13 +1391,13 @@ function formatNumberFull(num) {
 function getModelColor(modelId) {
     const settings = getSettings();
 
-    // Return persisted color if exists
-    if (settings.modelColors[modelId]) {
+    // Return persisted color if valid (colors are rendered into inline styles)
+    if (isModelColor(settings.modelColors[modelId])) {
         return settings.modelColors[modelId];
     }
 
     // Get all existing assigned colors to avoid duplicates
-    const existingColors = Object.values(settings.modelColors);
+    const existingColors = Object.values(settings.modelColors).filter(isModelColor);
 
     // Generate a random color that's distinct from existing ones
     let newColor;
@@ -1456,11 +1459,22 @@ function colorDistance(c1, c2) {
 }
 
 /**
+ * Whether a value is a color in the format the extension stores (#rrggbb, from
+ * hslToHex or the color picker)
+ * @param {any} value
+ * @returns {boolean}
+ */
+function isModelColor(value) {
+    return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value);
+}
+
+/**
  * Set color for a model
  * @param {string} modelId - Model identifier
  * @param {string} color - Hex color code
  */
 function setModelColor(modelId, color) {
+    if (!isModelColor(color)) return;
     const settings = getSettings();
     settings.modelColors[modelId] = color;
     saveSettings();
@@ -1602,6 +1616,47 @@ function exportUsageData() {
 }
 
 /**
+ * Copy an imported usage bucket, keeping only its counters (as finite non-negative
+ * numbers) and nested models/sources maps
+ * @param {any} value
+ * @returns {Object|null} null when the value is not a bucket
+ */
+function sanitizeUsageBucket(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const bucket = {};
+    for (const field of ['input', 'output', 'reasoning', 'total', 'messageCount', 'stopped', 'failed']) {
+        if (!Object.hasOwn(value, field)) continue; // Missing counters stay missing (legacy data)
+        const count = Number(value[field]);
+        bucket[field] = Number.isFinite(count) && count > 0 ? count : 0;
+    }
+    for (const field of ['models', 'sources']) {
+        if (Object.hasOwn(value, field)) bucket[field] = sanitizeUsageBuckets(value[field], true);
+    }
+    return bucket;
+}
+
+/**
+ * Copy an imported map of usage buckets (byDay, byModel, models, ...), dropping invalid entries
+ * @param {any} map
+ * @param {boolean} [nested] Nested models maps may hold legacy plain token totals
+ * @returns {Object}
+ */
+function sanitizeUsageBuckets(map, nested = false) {
+    const buckets = {};
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return buckets;
+    for (const [key, value] of Object.entries(map)) {
+        if (key === '__proto__') continue;
+        if (nested && typeof value === 'number') {
+            buckets[key] = Number.isFinite(value) && value > 0 ? value : 0;
+            continue;
+        }
+        const bucket = sanitizeUsageBucket(value);
+        if (bucket) buckets[key] = bucket;
+    }
+    return buckets;
+}
+
+/**
  * Import usage data from JSON
  * @param {string} jsonString - JSON string to import
  * @returns {Object} Result object with success status and message
@@ -1636,56 +1691,57 @@ function importUsageData(jsonString) {
 
     // Replace byDay data (overwrite existing days to prevent doubling)
     if (data.usage.byDay) {
-        for (const [dayKey, dayData] of Object.entries(data.usage.byDay)) {
+        for (const [dayKey, dayData] of Object.entries(sanitizeUsageBuckets(data.usage.byDay))) {
             settings.usage.byDay[dayKey] = dayData;
         }
     }
 
     // Replace byHour data (overwrite existing hours to prevent doubling)
     if (data.usage.byHour) {
-        for (const [hourKey, hourData] of Object.entries(data.usage.byHour)) {
+        for (const [hourKey, hourData] of Object.entries(sanitizeUsageBuckets(data.usage.byHour))) {
             settings.usage.byHour[hourKey] = hourData;
         }
     }
 
     // Replace byWeek data
     if (data.usage.byWeek) {
-        for (const [weekKey, weekData] of Object.entries(data.usage.byWeek)) {
+        for (const [weekKey, weekData] of Object.entries(sanitizeUsageBuckets(data.usage.byWeek))) {
             settings.usage.byWeek[weekKey] = weekData;
         }
     }
 
     // Replace byMonth data
     if (data.usage.byMonth) {
-        for (const [monthKey, monthData] of Object.entries(data.usage.byMonth)) {
+        for (const [monthKey, monthData] of Object.entries(sanitizeUsageBuckets(data.usage.byMonth))) {
             settings.usage.byMonth[monthKey] = monthData;
         }
     }
 
     // Replace byChat data
     if (data.usage.byChat) {
-        for (const [chatId, chatData] of Object.entries(data.usage.byChat)) {
+        for (const [chatId, chatData] of Object.entries(sanitizeUsageBuckets(data.usage.byChat))) {
             settings.usage.byChat[chatId] = chatData;
         }
     }
 
     // Replace byModel data
     if (data.usage.byModel) {
-        for (const [modelId, modelData] of Object.entries(data.usage.byModel)) {
+        for (const [modelId, modelData] of Object.entries(sanitizeUsageBuckets(data.usage.byModel))) {
             settings.usage.byModel[modelId] = modelData;
         }
     }
 
     // Replace bySource data
     if (data.usage.bySource) {
-        for (const [sourceId, sourceData] of Object.entries(data.usage.bySource)) {
+        for (const [sourceId, sourceData] of Object.entries(sanitizeUsageBuckets(data.usage.bySource))) {
             settings.usage.bySource[sourceId] = sourceData;
         }
     }
 
     // Replace allTime data
-    if (data.usage.allTime) {
-        settings.usage.allTime = data.usage.allTime;
+    const allTime = sanitizeUsageBucket(data.usage.allTime);
+    if (allTime) {
+        settings.usage.allTime = allTime;
     }
 
     // Replace model prices (overwrite existing)
@@ -1702,7 +1758,9 @@ function importUsageData(jsonString) {
 
     // Replace model colors (overwrite existing)
     if (data.modelColors) {
-        Object.assign(settings.modelColors, data.modelColors);
+        for (const [modelId, color] of Object.entries(data.modelColors)) {
+            if (modelId !== '__proto__' && isModelColor(color)) settings.modelColors[modelId] = color;
+        }
     }
 
     // Replace API errors when the export has them
@@ -2953,7 +3011,7 @@ function createMiniview() {
                 <span class="miniview-title">📊 Tokens</span>
                 <div class="miniview-controls">
                     <button class="miniview-mode-btn" title="Toggle data view (Session/Hourly/Daily)">
-                        <span class="miniview-mode-label">${mode.charAt(0).toUpperCase() + mode.slice(1)}</span>
+                        <span class="miniview-mode-label">${escapeHtml(mode.charAt(0).toUpperCase() + mode.slice(1))}</span>
                     </button>
                     <button class="miniview-pin-btn ${isPinned ? 'active' : ''}" title="${isPinned ? 'Unpin miniview' : 'Pin miniview'}">
                         📌

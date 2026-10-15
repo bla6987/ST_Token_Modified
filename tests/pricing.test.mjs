@@ -123,7 +123,8 @@ function runtime(settings) {
         getCurrentEasternTime: () => new Date('2026-09-12T12:00:00Z'), extensionName: 'token-usage-tracker',
         console: { log() {} }, normalizeErrorStore, renderErrorPanel() {},
     });
-    for (const name of ['invalidateModelPriceCache', 'getModelPrice', 'calculateCost', 'exportUsageData', 'importUsageData']) {
+    for (const name of ['invalidateModelPriceCache', 'getModelPrice', 'calculateCost', 'exportUsageData', 'importUsageData',
+        'sanitizeUsageBucket', 'sanitizeUsageBuckets', 'isModelColor']) {
         vm.runInContext(extract(name), context);
     }
     return context;
@@ -212,4 +213,41 @@ test('old pricing imports still work and malformed new backups fail before usage
     assert.equal(r.calculateCost(1e6, 1e6, model), 18);
     assert.throws(() => r.importUsageData(JSON.stringify({ version: '1.1', usage: { allTime: { total: 999 } }, modelPrices: {}, sharedModelPrices: {}, modelPriceGroups: { alias: 12 } })), /Invalid pricing backup/);
     assert.equal(s.usage.allTime.total, 1);
+});
+
+test('imports keep only numeric counters and stored color formats; renderers neutralize poisoned settings', () => {
+    const xss = '<img src=x onerror=alert(1)>';
+    const usage = { allTime: {}, byDay: {}, byHour: {}, byWeek: {}, byMonth: {}, byChat: {}, byModel: {}, bySource: {} };
+    const s = { ...state(), usage, modelColors: {} };
+    const r = runtime(s);
+    r.importUsageData(JSON.stringify({ version: '1.1', usage: {
+        allTime: { total: xss, input: '12', output: -5, failed: 1e999, note: xss },
+        byDay: { '2026-10-01': { total: 7, models: { m: { total: xss, input: 3 }, legacy: 40, bad: xss },
+            sources: { custom: { total: '4', models: { m: { output: xss } } } } }, '2026-10-02': xss },
+        byWeek: { '2026-W40': [1, 2] }, byModel: { m: { total: 9, messageCount: xss }, ['__proto__']: { total: 1 } },
+    }, modelColors: { a: '#12abEF', b: `red;"><x ${xss}`, c: 'hsl(1, 2%, 3%)', ['__proto__']: { d: '#000000' } } }));
+    assert.equal(JSON.stringify(s.usage.allTime), JSON.stringify({ input: 12, output: 0, total: 0, failed: 0 }));
+    assert.equal(JSON.stringify(s.usage.byDay), JSON.stringify({ '2026-10-01': { total: 7,
+        models: { m: { input: 3, total: 0 }, legacy: 40 }, sources: { custom: { total: 4, models: { m: { output: 0 } } } } } }));
+    assert.deepEqual(Object.keys(s.usage.byWeek), []);
+    assert.equal(JSON.stringify(s.usage.byModel), JSON.stringify({ m: { total: 9, messageCount: 0 } }));
+    assert.equal(Object.getPrototypeOf(s.usage.byModel), Object.prototype);
+    assert.equal(JSON.stringify(s.modelColors), JSON.stringify({ a: '#12abEF' }));
+    assert.equal(Object.getPrototypeOf(s.modelColors), Object.prototype);
+
+    for (const name of ['formatTokens', 'getModelColor', 'hslToHex', 'isTooSimilar', 'colorDistance', 'setModelColor']) {
+        vm.runInContext(extract(name), r);
+    }
+    assert.equal(r.formatTokens(xss), '0');
+    assert.equal(r.formatTokens(Infinity), '0');
+    assert.equal(r.formatTokens('1500'), '1.5K');
+    assert.equal(r.formatTokens(42), '42');
+    s.modelColors.poisoned = `red;"><x ${xss}`;
+    s.modelColors.number = 5;
+    const color = r.getModelColor('poisoned');
+    assert.match(color, /^#[0-9a-f]{6}$/);
+    assert.equal(s.modelColors.poisoned, color);
+    assert.equal(r.getModelColor('a'), '#12abEF');
+    r.setModelColor('a', xss);
+    assert.equal(s.modelColors.a, '#12abEF');
 });

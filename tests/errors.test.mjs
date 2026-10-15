@@ -212,3 +212,11 @@ test('retracting a fallback preserves other errors and never affects a cleared s
     assert.equal(stats.lastError.message, 'limited');
     assert.equal(errors.retractRouteError(errors.createErrorStore(), inferred), false);
 });
+
+test('imported route counts are numeric before they reach the errors panel', () => {
+    const store = errors.normalizeErrorStore({ routes: { 'custom||m|': { ok: '"><img src=x onerror=alert(1)>', errors: '2' } }, log: [] });
+    const [route] = errors.erroringRoutes(store);
+    assert.equal(route.errors, 2);
+    assert.equal(route.attempts, 2);
+    assert.equal(errors.erroringRoutes({ routes: { r: { ok: '<b>', errors: 1 } } })[0].attempts, 1);
+});
