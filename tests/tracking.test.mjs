@@ -21,7 +21,7 @@ const FUNCTIONS = [
     'handleGenerationStopped', 'handleGenerationEnded', 'handleAttemptResolved', 'recordAttempt',
     'countMessageOutput', 'extractResponseText', 'flushPendingQuietGeneration',
     'installGenerationRequestObserver', 'observeGenerationRequest', 'parseRequestBody', 'isAbortedRequest',
-    'observeGenerationResponse', 'inspectResponse', 'recordHttpError', 'watchStreamedResponse', 'recordRouteResult', 'recordInferredFailure',
+    'observeGenerationResponse', 'readInspectionBody', 'inspectResponse', 'recordHttpError', 'watchStreamedResponse', 'recordRouteResult', 'recordInferredFailure',
 ];
 
 const emptyUsage = () => ({
@@ -132,12 +132,8 @@ function runtime() {
     };
 }
 
-const ok = (json = {}) => {
-    const body = JSON.stringify(json);
-    const response = { ok: true, status: 200, json: async () => JSON.parse(body), clone: () => ok(json) };
-    return response;
-};
-const httpError = (status) => ({ ok: false, status, json: async () => ({ error: true }), text: async () => '{"error":true}', clone() { return this; } });
+const ok = (json = {}) => Response.json(json);
+const httpError = (status) => Response.json({ error: true }, { status });
 const abortError = () => Object.assign(new Error('aborted'), { name: 'AbortError' });
 
 function counts(bucket) {

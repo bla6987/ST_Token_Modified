@@ -11,7 +11,10 @@ export const ERROR_ROUTE_LIMIT = 300;
 /** Characters kept of an error message */
 const MESSAGE_LIMIT = 300;
 /** Characters kept of a streamed body that has no SSE event yet (it may be a plain JSON error) */
-const PLAIN_BODY_LIMIT = 64 * 1024;
+export const PLAIN_BODY_LIMIT = 64 * 1024;
+export const STREAM_FRAME_LIMIT = 256 * 1024;
+export const STREAM_DATA_LINE_LIMIT = 4096;
+export const ERROR_LABEL_LIMIT = 64;
 
 /**
  * @typedef {object} Route
@@ -81,6 +84,8 @@ export function normalizeErrorStore(store) {
     store.routes = routes;
     store.log = store.log.filter(entry => entry && typeof entry === 'object').slice(-ERROR_LOG_LIMIT)
         .map(scrubStoredRecord);
+    for (const stats of Object.values(routes)) pruneErrorLabels(stats);
+    pruneRoutes(store, '');
     return store;
 }
 
@@ -292,84 +297,118 @@ export function payloadError(data) {
 export function createStreamScanner() {
     let buffer = '';
     let dataLines = [];
+    let dataChars = 0;
     let events = 0;
     let plain = '';
     let provider = '';
     let hasToolCalls = false;
+    let discardLine = false;
+    let discardEvent = false;
+    let oversizedFrames = 0;
+
+    function discardOversizedEvent() {
+        if (!discardEvent) oversizedFrames++;
+        discardEvent = true;
+        dataLines = [];
+        dataChars = 0;
+        plain = '';
+    }
+
+    function addError(errors, error) {
+        // A single huge network chunk can contain many invalid events.
+        if (errors.length < 32) errors.push(error);
+    }
 
     function dispatch(errors) {
+        if (discardEvent) {
+            discardEvent = false;
+            events++;
+            return;
+        }
         if (!dataLines.length) return;
         const raw = dataLines.join('\n');
         dataLines = [];
+        dataChars = 0;
+        plain = '';
         events++;
         if (raw === '[DONE]') return;
         let data;
-        try {
-            data = JSON.parse(raw);
-        } catch {
-            // SillyTavern fails the stream on an event that is not JSON
-            errors.push({ message: clip(raw) || 'Invalid stream event', code: '' });
+        try { data = JSON.parse(raw); } catch {
+            addError(errors, { message: clip(raw) || 'Invalid stream event', code: '' });
             return;
         }
         provider ||= payloadProvider(data);
         hasToolCalls ||= payloadHasToolCalls(data);
         const error = payloadError(data);
-        if (error) errors.push(error);
+        if (error) addError(errors, error);
     }
 
     function processLine(line, errors) {
+        if (line.endsWith('\r')) line = line.slice(0, -1);
         if (line === '') return dispatch(errors);
-        if (line.startsWith(':')) return;
+        if (discardEvent || line.startsWith(':')) return;
         const colon = line.indexOf(':');
         if ((colon === -1 ? line : line.slice(0, colon)) !== 'data') return;
         let value = colon === -1 ? '' : line.slice(colon + 1);
         if (value.startsWith(' ')) value = value.slice(1);
+        if (dataChars + value.length + 1 > STREAM_FRAME_LIMIT || dataLines.length >= STREAM_DATA_LINE_LIMIT) {
+            discardOversizedEvent();
+            return;
+        }
         dataLines.push(value);
+        dataChars += value.length + 1;
     }
 
     return {
-        /**
-         * @param {string} chunk Decoded body text
-         * @returns {Array<{message: string, code: string}>} Errors in the events completed by this chunk
-         */
         push(chunk) {
             const errors = [];
-            if (!events && plain.length < PLAIN_BODY_LIMIT) plain += chunk;
-            buffer += chunk;
-            const lines = buffer.split(/\r?\n/);
-            buffer = lines.pop();
-            for (const line of lines) processLine(line, errors);
-            return errors;
-        },
-        /**
-         * @returns {Array<{message: string, code: string}>} Errors in the rest of the body
-         */
-        finish() {
-            const errors = [];
-            if (buffer) processLine(buffer, errors);
-            buffer = '';
-            dispatch(errors);
-            if (!events && plain.trim()) {
-                // Not an event stream: the server answered with a plain body, usually a JSON error
-                let data = null;
-                try {
-                    data = JSON.parse(plain);
-                } catch {
-                    // Not JSON either
+            if (!events && !discardEvent && plain.length < PLAIN_BODY_LIMIT) {
+                plain += chunk.slice(0, PLAIN_BODY_LIMIT - plain.length);
+            }
+            // Do not append/split the whole chunk. Even a single network chunk or
+            // a line without a newline must respect the frame cap.
+            let offset = 0;
+            while (offset < chunk.length) {
+                const newline = chunk.indexOf('\n', offset);
+                const end = newline === -1 ? chunk.length : newline;
+                if (!discardLine) {
+                    if (buffer.length + end - offset + dataChars > STREAM_FRAME_LIMIT) {
+                        buffer = '';
+                        discardLine = true;
+                        discardOversizedEvent();
+                    } else {
+                        buffer += chunk.slice(offset, end);
+                    }
                 }
-                if (data && typeof data === 'object' && (data.error || data.message || data.detail)) {
-                    errors.push(describeError(data));
-                }
+                if (newline === -1) break;
+                if (!discardLine) processLine(buffer, errors);
+                buffer = '';
+                discardLine = false;
+                offset = newline + 1;
             }
             return errors;
         },
-        /** Upstream provider named by the stream */
-        get provider() {
-            return provider;
+        finish() {
+            const errors = [];
+            if (buffer && !discardLine) processLine(buffer, errors);
+            buffer = '';
+            discardLine = false;
+            dispatch(errors);
+            if (!events && plain.trim()) {
+                let data = null;
+                try { data = JSON.parse(plain); } catch { /* incomplete/plain text */ }
+                if (data && typeof data === 'object' && (data.error || data.message || data.detail)) {
+                    addError(errors, describeError(data));
+                }
+            }
+            plain = '';
+            return errors;
         },
-        get hasToolCalls() {
-            return hasToolCalls;
-        },
+        get provider() { return provider; },
+        get hasToolCalls() { return hasToolCalls; },
+        // Oversized diagnostic events are skipped, never invented API failures.
+        get oversizedFrames() { return oversizedFrames; },
+        get bufferedChars() { return buffer.length + dataChars + plain.length; },
     };
 }
 
@@ -382,11 +421,22 @@ export function errorLabel(error) {
     return label(error?.status) || text(error?.code) || text(error?.kind) || 'error';
 }
 
-/**
- * Drop the least recently used routes beyond the limit, never the one just used
- * @param {object} store
- * @param {string} keepKey
- */
+/** Keep a bounded label breakdown while preserving the total error count. */
+function pruneErrorLabels(stats) {
+    const labels = Object.entries(stats.byLabel || {});
+    if (labels.length <= ERROR_LABEL_LIMIT) return;
+    labels.sort((a, b) => Number(b[1]) - Number(a[1]));
+    const kept = Object.create(null);
+    let other = 0;
+    for (const [name, count] of labels) {
+        if (name !== 'other' && Object.keys(kept).length < ERROR_LABEL_LIMIT - 1) kept[name] = Number(count) || 0;
+        else other += Number(count) || 0;
+    }
+    kept.other = other;
+    stats.byLabel = kept;
+}
+
+/** Drop the least recently used routes beyond the limit, except the one just used. */
 function pruneRoutes(store, keepKey) {
     const keys = Object.keys(store.routes);
     let excess = keys.length - ERROR_ROUTE_LIMIT;
@@ -433,6 +483,7 @@ export function recordRouteOutcome(store, route, error, { now = Date.now(), genT
     Object.defineProperty(stats.byLabel, errorKey, { value: (Number(stats.byLabel[errorKey]) || 0) + 1,
         writable: true, enumerable: true, configurable: true });
     stats.lastError = entry;
+    pruneErrorLabels(stats);
 
     store.log.push({ ...route, ...entry, genType: clip(genType) });
     if (store.log.length > ERROR_LOG_LIMIT) store.log.splice(0, store.log.length - ERROR_LOG_LIMIT);
@@ -449,7 +500,9 @@ export function retractRouteError(store, logEntry) {
     stats.errors = Math.max(0, stats.errors - 1);
     const name = errorLabel(logEntry);
     if (stats.byLabel[name] > 1) stats.byLabel[name]--;
-    else delete stats.byLabel[name];
+    else if (stats.byLabel[name] === 1) delete stats.byLabel[name];
+    else if (stats.byLabel.other > 1) stats.byLabel.other--;
+    else delete stats.byLabel.other;
     stats.lastError = store.log.slice().reverse().find(entry => routeKey(entry) === routeKey(logEntry)) || null;
     if (!stats.ok && !stats.errors) delete store.routes[routeKey(logEntry)];
     return true;

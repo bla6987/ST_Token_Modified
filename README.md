@@ -139,3 +139,31 @@ Based on [Extension-TokenUsage](https://github.com/Vibecoder9000/Extension-Token
 ## License
 
 This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See the `LICENSE` file for details.
+
+## Memory bounds and optional runtime bus
+
+Generation request observation works without Runtime Signal Bus. With bus 1.1 it
+shares a lazy, read-only JSON parse with other compatible extensions. A v1.0 bus
+uses local parsing, and an older bus already inside another extension's fetch
+wrapper keeps the standalone interception path. No bus dependency is required.
+
+Main-generation response diagnostics read at most 256 KiB; HTTP error diagnostics
+read at most 64 KiB. They use observation clones and leave SillyTavern's original
+response readable. Detailed errors beyond a prefix may be unavailable; normal
+generation lifecycle events still determine the recorded main-generation outcome.
+
+The streaming scanner keeps at most 262,144 characters per event/line, 4,096
+data lines per event, and a 65,536-character plain-body prefix. It decodes incoming
+chunks in 64 KiB pieces. Oversized diagnostic frames are skipped until the
+next event boundary, after which later errors can still be found. An oversized
+frame does not invent an API failure or interrupt the caller's stream.
+
+Successful quiet generations still read their finite JSON response because there
+is no final chat-message event from which to count output tokens. The resulting
+accounting retains only output text/reasoning instead of the full response object.
+This necessary token-counting work is separate from bounded diagnostic inspection.
+
+The error log remains capped at 100 entries and 300 routes, including imported
+stores. Each route keeps up to 64 error-label groups; less frequent labels are
+combined into `other` while preserving aggregate error totals. Existing usage
+totals and daily/hourly/model/chat counters are unchanged.

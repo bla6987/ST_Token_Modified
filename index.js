@@ -4423,6 +4423,50 @@ const TOKEN_USAGE_FETCH_PATCHED = Symbol.for('tokenUsageTrackerFetchPatched');
  * The request itself and the caller's Response are never modified.
  */
 function installGenerationRequestObserver() {
+    const runtimeBus = window.STRuntimeBus;
+    // Bus 1.0 re-wraps an existing outer wrapper unsafely. Preserve standalone
+    // behavior in that case; v1.1 explicitly supports this registration order.
+    const olderBusUnderWrapper = !runtimeBus?.fetch?.preservesOuterWrappers
+        && runtimeBus?.fetch?.getChainInfo?.().installed
+        && window.fetch?.__fetchInterceptorName !== 'runtime_signal_bus';
+    if (!olderBusUnderWrapper && typeof runtimeBus?.fetch?.registerInterceptor === 'function') {
+        if (runtimeBus[TOKEN_USAGE_FETCH_PATCHED]) return;
+        try {
+            const unregister = runtimeBus.fetch.registerInterceptor({
+                id: 'token-usage-tracker',
+                priority: 80,
+                requestObserve(reqCtx) {
+                    try {
+                        const observation = observeGenerationRequest(reqCtx.target, reqCtx.options, reqCtx);
+                        if (observation) reqCtx.meta.tokenUsageTracker = observation;
+                    } catch (error) {
+                        console.error('[Token Usage Tracker] Error observing generation request:', error);
+                    }
+                },
+                responseObserve(resCtx) {
+                    const observation = resCtx.request.meta.tokenUsageTracker;
+                    delete resCtx.request.meta.tokenUsageTracker;
+                    // Clone synchronously before the caller can consume the body,
+                    // then inspect asynchronously without delaying a live stream.
+                    if (observation) observeGenerationResponse(observation, {
+                        then(onResponse) {
+                            try { return Promise.resolve(onResponse(resCtx.response)); }
+                            catch (error) { return Promise.reject(error); }
+                        },
+                    });
+                },
+                errorObserve(errCtx) {
+                    const observation = errCtx.request.meta.tokenUsageTracker;
+                    delete errCtx.request.meta.tokenUsageTracker;
+                    if (observation) observeGenerationResponse(observation, Promise.reject(errCtx.error));
+                },
+            });
+            runtimeBus[TOKEN_USAGE_FETCH_PATCHED] = unregister || true;
+            return;
+        } catch (error) {
+            console.warn('[Token Usage Tracker] Runtime bus unavailable; using standalone observer', error);
+        }
+    }
     const originalFetch = window.fetch;
     if (typeof originalFetch !== 'function' || originalFetch[TOKEN_USAGE_FETCH_PATCHED]) return;
 
@@ -4451,7 +4495,7 @@ function installGenerationRequestObserver() {
  * @param {RequestInit} [init]
  * @returns {{attempt: object|null, route: object|null, streaming: boolean, signal: AbortSignal|null, genType: string}|null}
  */
-function observeGenerationRequest(input, init) {
+function observeGenerationRequest(input, init, requestContext = null) {
     const url = input instanceof URL ? input.href : (typeof input === 'string' ? input : input?.url);
     if (!url) return null;
     const path = new URL(url, window.location.origin).pathname;
@@ -4461,7 +4505,8 @@ function observeGenerationRequest(input, init) {
     const signal = init?.signal ?? input?.signal ?? null;
     if (signal?.aborted) return null;
 
-    const body = parseRequestBody(init?.body);
+    const body = typeof requestContext?.getRequestJson === 'function'
+        ? requestContext.getRequestJson() : parseRequestBody(init?.body);
     const streaming = body?.stream === true || body?.streaming === true;
     const attempt = attemptTracker.bindRequest({ streaming });
     // SillyTavern creates the streaming processor just before sending a streaming request
@@ -4541,11 +4586,42 @@ function observeGenerationResponse(observation, request) {
  * @param {{attempt: object|null, route: object|null}} observation
  * @param {Response} response
  */
+async function readInspectionBody(response, maxBytes = 256 * 1024) {
+    const reader = response.body?.getReader?.();
+    if (!reader) return { text: '', truncated: true };
+    const decoder = new TextDecoder();
+    let text = '';
+    let bytes = 0;
+    let complete = false;
+    try {
+        while (bytes < maxBytes) {
+            const { done, value } = await reader.read();
+            if (done) { complete = true; break; }
+            const part = value.subarray(0, maxBytes - bytes);
+            bytes += part.byteLength;
+            text += decoder.decode(part, { stream: true });
+        }
+        text += decoder.decode();
+        return { text, truncated: !complete };
+    } finally {
+        if (!complete) reader.cancel().catch(() => {});
+        reader.releaseLock?.();
+    }
+}
+
 async function inspectResponse(observation, response) {
     const { attempt, route } = observation;
     let data = null;
     try {
-        data = await response.json();
+        if (attempt?.kind === 'quiet') {
+            // Quiet generations have no final message event: their actual output
+            // is required for accurate token counts, not merely diagnostics.
+            data = await response.json();
+        } else {
+            const prefix = await readInspectionBody(response);
+            observation.inspectionTruncated = prefix.truncated;
+            if (!prefix.truncated) data = JSON.parse(prefix.text);
+        }
     } catch {
         // Not JSON: count the generation without output text
     }
@@ -4560,11 +4636,16 @@ async function inspectResponse(observation, response) {
         attemptTracker.resolve(attempt, 'failed');
     } else if (attempt?.meta.hasToolCalls) {
         // Tool-only rounds are valid responses and can start a follow-up generation.
-        attemptTracker.resolve(attempt, 'succeeded', { responseData: data });
+        attemptTracker.resolve(attempt, 'succeeded', {
+            text: extractResponseText(data), reasoning: await extractResponseReasoning(data),
+        });
     } else if (attempt?.kind === 'quiet') {
-        const hasOutput = Boolean(extractResponseText(data)?.trim() || (await extractResponseReasoning(data))?.trim());
+        const text = extractResponseText(data);
+        const reasoning = await extractResponseReasoning(data);
+        const hasOutput = Boolean(text?.trim() || reasoning?.trim());
+        data = null;
         attemptTracker.resolve(attempt, hasOutput ? 'succeeded' : 'failed', {
-            responseData: data, failureCode: 'empty_response',
+            text, reasoning, failureCode: 'empty_response',
         });
     }
 }
@@ -4577,13 +4658,15 @@ async function inspectResponse(observation, response) {
 async function recordHttpError(observation, response) {
     let body = '';
     try {
-        body = await response.text();
+        const prefix = await readInspectionBody(response, 64 * 1024);
+        body = prefix.text;
+        observation.inspectionTruncated = prefix.truncated;
     } catch {
         // Body unavailable: the status is enough
     }
     let data = body;
     try {
-        data = JSON.parse(body);
+        if (!observation.inspectionTruncated) data = JSON.parse(body);
     } catch {
         // Plain text or an HTML error page
     }
@@ -4607,11 +4690,17 @@ async function watchStreamedResponse(observation, response) {
     try {
         while (!error) {
             const { done, value } = await reader.read();
-            const errors = done
-                ? [...scanner.push(decoder.decode()), ...scanner.finish()]
-                : scanner.push(decoder.decode(value, { stream: true }));
-            if (errors.length) error = { kind: 'stream', ...errors[0] };
-            if (done) break;
+            if (done) {
+                const errors = [...scanner.push(decoder.decode()), ...scanner.finish()];
+                if (errors.length) error = { kind: 'stream', ...errors[0] };
+                break;
+            }
+            // A transport may deliver one huge chunk. Decode bounded pieces so
+            // the scanner cap is not preceded by a full-size JS string copy.
+            for (let offset = 0; offset < value.byteLength && !error; offset += 64 * 1024) {
+                const errors = scanner.push(decoder.decode(value.subarray(offset, offset + 64 * 1024), { stream: true }));
+                if (errors.length) error = { kind: 'stream', ...errors[0] };
+            }
         }
     } catch (readError) {
         if (!isAbortedRequest(observation, readError)) {
@@ -4623,9 +4712,12 @@ async function watchStreamedResponse(observation, response) {
             if (!(sp?.isStopped === true && sp.isFinished !== true)) return;
             error = { kind: 'stream', message: 'SillyTavern could not read the stream' };
         }
+    } finally {
+        // This is the observation clone only. Never await tee cancellation.
+        reader.cancel().catch(() => {});
+        reader.releaseLock?.();
     }
-    // Stop buffering the rest of this copy of the stream
-    if (error) reader.cancel().catch(() => {});
+    observation.oversizedStreamFrames = scanner.oversizedFrames;
 
     if (observation.attempt) observation.attempt.meta.hasToolCalls ||= scanner.hasToolCalls;
     recordRouteResult(observation, error, scanner.provider);
