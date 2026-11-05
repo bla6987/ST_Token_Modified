@@ -37,7 +37,7 @@ function runtime() {
     const responses = [];
     const chat = [];
 
-    const context = vm.createContext({
+    const context = vm.createContext({ usageRevision: 0,
         ...metrics,
         ...errors,
         URL,
@@ -81,6 +81,7 @@ function runtime() {
     });
     for (const name of FUNCTIONS) vm.runInContext(extract(name), context);
     vm.runInContext(`
+        ${source.match(/^const _fmtEasternParts = .*$/m)[0]}
         let pendingGenerationStart = null;
         const GENERATION_REQUEST_PATHS = new Set(['/api/backends/chat-completions/generate', '/api/backends/text-completions/generate']);
         const TOKEN_USAGE_FETCH_PATCHED = Symbol.for('tokenUsageTrackerFetchPatched');
@@ -807,4 +808,26 @@ test('a network error is recorded against the route', async () => {
     await r.settle();
     assert.equal(r.route(CUSTOM_KEY).byLabel.network, 1);
     assert.equal(r.route(CUSTOM_KEY).lastError.message, 'Failed to fetch');
+});
+
+test('output accounting snapshots text and cached counts before awaiting reasoning', async () => {
+ const r=runtime();let release;r.context.countTokens=()=>new Promise(resolve=>{release=resolve;});
+ const message={mes:'old',extra:{reasoning:'thought',token_count:3}};
+ const pending=r.context.countMessageOutput(message,{meta:{}});message.extra.token_count=99;release(1);
+ assert.equal((await pending).outputTokens,2);
+});
+test('reasoning-only cached counts are not counted again as visible output', async () => {
+ const r=runtime();const output=await r.context.countMessageOutput({mes:'',extra:{reasoning:'one two',token_count:2}},{meta:{}});
+ assert.equal(output.outputTokens,0);assert.equal(output.reasoningTokens,2);
+});
+test('a reset boundary discards an older in-flight accounting job', async () => {
+ const r=runtime();let release;const input=new Promise(resolve=>{release=resolve;});
+ const pending=r.context.recordAttempt({meta:{usageRevision:0,inputTokensPromise:input}},'succeeded',{text:'one'});
+ r.context.usageRevision++;release(10);await pending;assert.equal(r.settings.usage.allTime.total,0);
+});
+test('all generated nonstreaming choices contribute output once', async () => {
+ const r=runtime();r.context.handleGenerationStarted('normal',{},false);r.context.handleGenerateAfterData({prompt:[]},false);
+ r.respond(ok({choices:[{message:{content:'one'}},{message:{content:'two three'}}]}));await r.send({body:{...CUSTOM,n:2}});
+ r.chat.push({mes:'one'});r.context.handleMessageReceived(0,'normal');r.context.handleGenerationEnded();await r.advance(5000);
+ assert.equal(r.settings.usage.allTime.output,3);assert.equal(r.settings.usage.allTime.messageCount,1);
 });

@@ -294,7 +294,8 @@ export function payloadError(data) {
  * SillyTavern only shows a toast for an error event and then finishes the stream
  * as if it succeeded.
  */
-export function createStreamScanner() {
+export function createStreamScanner({ onData = null } = {}) {
+    let terminal = false;
     let buffer = '';
     let dataLines = [];
     let dataChars = 0;
@@ -331,12 +332,13 @@ export function createStreamScanner() {
         dataChars = 0;
         plain = '';
         events++;
-        if (raw === '[DONE]') return;
+        if (raw === '[DONE]') { terminal = true; return; }
         let data;
         try { data = JSON.parse(raw); } catch {
             addError(errors, { message: clip(raw) || 'Invalid stream event', code: '' });
             return;
         }
+        onData?.(data);
         provider ||= payloadProvider(data);
         hasToolCalls ||= payloadHasToolCalls(data);
         const error = payloadError(data);
@@ -404,6 +406,7 @@ export function createStreamScanner() {
             plain = '';
             return errors;
         },
+        get done() { return terminal; },
         get provider() { return provider; },
         get hasToolCalls() { return hasToolCalls; },
         // Oversized diagnostic events are skipped, never invented API failures.

@@ -21,7 +21,7 @@ function runtime(mode = 'none', attempt = null) {
     const baseFetch = async () => { if (response instanceof Error) throw response; return response; };
     const window = { fetch: baseFetch, location: { origin: 'http://localhost:8000' } };
     if (mode !== 'none') window.STRuntimeBus = { fetch: { registerInterceptor(spec) { interceptor = spec; return () => {}; } } };
-    const context = vm.createContext({ ...errors, window, URL, TextDecoder, streamingProcessor: null,
+    const context = vm.createContext({ usageRevision: 0, ...errors, window, URL, TextDecoder, streamingProcessor: null,
         TOKEN_USAGE_FETCH_PATCHED: Symbol.for('tokenUsageTrackerFetchPatched'),
         GENERATION_REQUEST_PATHS: new Set(['/api/backends/chat-completions/generate']),
         JSON: { stringify: JSON.stringify, parse(value) {

@@ -116,7 +116,7 @@ function extract(name) {
     return source.slice(start, source.indexOf('\n}', start) + 2);
 }
 function runtime(settings) {
-    const context = vm.createContext({
+    const context = vm.createContext({ usageRevision: 0,
         ...pricing, settings, getSettings: () => settings,
         modelPriceCache: new Map(), modelConfigState: {}, modelConfigPriceDrafts: new Map(),
         saveSettings() {}, getUsageStats: () => ({}), eventSource: { emit() {} },
@@ -231,7 +231,7 @@ test('imports keep only numeric counters and stored color formats; renderers neu
         models: { m: { input: 3, total: 0 }, legacy: 40 }, sources: { custom: { total: 4, models: { m: { output: 0 } } } } } }));
     assert.deepEqual(Object.keys(s.usage.byWeek), []);
     assert.equal(JSON.stringify(s.usage.byModel), JSON.stringify({ m: { total: 9, messageCount: 0 } }));
-    assert.equal(Object.getPrototypeOf(s.usage.byModel), Object.prototype);
+    assert.equal(Object.hasOwn(s.usage.byModel, '__proto__'), false);
     assert.equal(JSON.stringify(s.modelColors), JSON.stringify({ a: '#12abEF' }));
     assert.equal(Object.getPrototypeOf(s.modelColors), Object.prototype);
 

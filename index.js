@@ -17,12 +17,15 @@ import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.j
 import { SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
 import { getChatCompletionModel, oai_settings } from '../../../openai.js';
 import { textgenerationwebui_settings as textgen_settings } from '../../../textgen-settings.js';
+// Namespace import, as above: getTextGenModel is optional
+import * as textgenSettingsModule from '../../../textgen-settings.js';
 import { parsePrice, configuredPrice, collectPriceGroups, saveSharedPrice, readPricingSnapshot, matchingPriceModels, applyMatchingPrices } from './pricing.js';
 import { bumpCounts, generationStats, generationPoint, hasCompleteOutcomes, countAxisScale, createAttemptTracker } from './metrics.js';
 import { createErrorStore, normalizeErrorStore, routeFromRequest, payloadError, payloadProvider, payloadHasToolCalls, describeError, scrubCredentials, statusFromReason, createStreamScanner, recordRouteOutcome, retractRouteError, erroringRoutes, errorBreakdown, errorLabel } from './errors.js';
 
 import { buildUsageCsv } from './usage-csv.js';
 import { createUsageClock } from './time.js';
+import { collectPromptTexts, createTokenCounter } from './token-count.js';
 
 const extensionName = 'token-usage-tracker';
 
@@ -35,18 +38,10 @@ const _fmtDayFull = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZON
 const _fmtHourDisplay = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, hour: 'numeric', hour12: true });
 const _fmtHourFull = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', hour12: true });
 const _fmtMinute = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
+const _fmtEasternParts = new Intl.DateTimeFormat('en-US', { timeZone: EASTERN_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' });
 
 function getEasternParts(date) {
-    const dtf = new Intl.DateTimeFormat('en-US', {
-        timeZone: EASTERN_TIMEZONE,
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        hourCycle: 'h23',
-    });
-
-    const parts = dtf.formatToParts(date);
+    const parts = _fmtEasternParts.formatToParts(date);
     const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
     return {
         year: Number(map.year),
@@ -228,23 +223,33 @@ function getMonthKey(date = getCurrentEasternTime()) {
     return `${year}-${String(month).padStart(2, '0')}`;
 }
 
+const tokenCounter = createTokenCounter({
+    // Use async count exclusively to avoid blocking the main thread
+    // getTextTokens() can make synchronous XMLHttpRequests which freeze the UI
+    tokenize: text => getTokenCountAsync(text),
+    // Ultimate fallback: character-based estimate
+    estimate: text => Math.ceil(text.length / 3.35),
+    getSignature: getTokenizerSignature,
+    onError: error => console.error('[Token Usage Tracker] Error counting tokens:', error),
+});
+
+/**
+ * Everything besides the text that decides what getTokenCountAsync returns
+ * @returns {string}
+ */
+function getTokenizerSignature() {
+    const { tokenizerId, tokenizerName } = getFriendlyTokenizerName(main_api);
+    const textgenModel = main_api === 'textgenerationwebui' ? textgenSettingsModule.getTextGenModel?.() : null;
+    return JSON.stringify([main_api, tokenizerId, tokenizerName, getCurrentModelId(), textgenModel, stScript.online_status]);
+}
+
 /**
  * Count tokens using SillyTavern's native tokenizer (async, non-blocking)
  * @param {string} text - Text to tokenize
  * @returns {Promise<number>} Token count
  */
 async function countTokens(text) {
-    if (!text || typeof text !== 'string') return 0;
-
-    try {
-        // Use async count exclusively to avoid blocking the main thread
-        // getTextTokens() can make synchronous XMLHttpRequests which freeze the UI
-        return await getTokenCountAsync(text);
-    } catch (error) {
-        console.error('[Token Usage Tracker] Error counting tokens:', error);
-        // Ultimate fallback: character-based estimate
-        return Math.ceil(text.length / 3.35);
-    }
+    return tokenCounter.count(text);
 }
 
 /**
@@ -432,6 +437,7 @@ function addToUsageBuckets(tokens, counts, chatId, modelId, sourceId) {
         const entry = parent[key][id];
         entry.input = (entry.input || 0) + input;
         entry.output = (entry.output || 0) + output;
+        entry.reasoning = (entry.reasoning || 0) + reasoning;
         entry.total = (entry.total || 0) + total;
         bumpCounts(entry, counts);
         return entry;
@@ -446,7 +452,10 @@ function addToUsageBuckets(tokens, counts, chatId, modelId, sourceId) {
 
     // By day, with models for the stacked chart and sources (and their models) for filtering
     const dayKey = getDayKey(now);
-    if (!usage.byDay[dayKey]) usage.byDay[dayKey] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, models: {}, sources: {} };
+    if (!usage.byDay[dayKey]) {
+        usage.byDay[dayKey] = { input: 0, output: 0, reasoning: 0, total: 0, messageCount: 0, models: {}, sources: {} };
+        currentPeriodDays = null;
+    }
     const dayData = usage.byDay[dayKey];
     addTokens(dayData);
     if (modelId) addNested(dayData, 'models', modelId);
@@ -558,6 +567,7 @@ function resetSession() {
  * Reset all usage data
  */
 function resetAllUsage() {
+    usageRevision++;
     const settings = getSettings();
     settings.usage = structuredClone(defaultSettings.usage);
     settings.usage.session.startTime = getCurrentEasternTime().toISOString();
@@ -671,6 +681,7 @@ function getCurrentChatId() {
 /** Generation type and continue snapshot from the latest GENERATION_STARTED, consumed by GENERATE_AFTER_DATA */
 let pendingGenerationStart = null;
 /** Tracks each generation attempt from request to outcome (succeeded / stopped / failed) */
+let usageRevision = 0;
 const attemptTracker = createAttemptTracker({ onResolve: handleAttemptResolved });
 
 /**
@@ -679,84 +690,10 @@ const attemptTracker = createAttemptTracker({ onResolve: handleAttemptResolved }
  * @returns {Promise<number>} Total input token count
  */
 async function countInputTokens(generate_data) {
-    let inputTokens = 0;
-
-    if (generate_data.prompt) {
-        // For text completion APIs (kobold, novel, textgen) - prompt is a string
-        if (typeof generate_data.prompt === 'string') {
-            inputTokens = await countTokens(generate_data.prompt);
-        }
-        // For chat completion APIs (OpenAI) - prompt is an array of messages
-        else if (Array.isArray(generate_data.prompt)) {
-            for (const message of generate_data.prompt) {
-                if (message.content) {
-                    // Content can be a string or an array of content parts (for multimodal)
-                    if (typeof message.content === 'string') {
-                        inputTokens += await countTokens(message.content);
-                    } else if (Array.isArray(message.content)) {
-                        // Handle multimodal content (text + images)
-                        for (const part of message.content) {
-                            if (part.type === 'text' && part.text) {
-                                inputTokens += await countTokens(part.text);
-                            }
-                            if (part.type === 'image_url' || part.type === 'image') {
-                                // Estimate image tokens since we can't be precise without knowing the exact model arithmetic
-                                // 765 tokens is the cost of a 1024x1024 image in OpenAI high detail mode
-                                inputTokens += 765;
-                            }
-                        }
-                    }
-                }
-                // Count role tokens (~1 token per role)
-                if (message.role) {
-                    inputTokens += 1;
-                }
-                // Count name field tokens (used in function calls, tool results, etc.)
-                if (message.name) {
-                    inputTokens += await countTokens(message.name);
-                }
-                // Count tool_calls tokens (Standard OpenAI)
-                if (Array.isArray(message.tool_calls)) {
-                    for (const toolCall of message.tool_calls) {
-                        if (toolCall.function) {
-                            if (toolCall.function.name) {
-                                inputTokens += await countTokens(toolCall.function.name);
-                            }
-                            if (toolCall.function.arguments) {
-                                inputTokens += await countTokens(toolCall.function.arguments);
-                            }
-                        }
-                    }
-                }
-                // Count invocations tokens (SillyTavern internal)
-                if (Array.isArray(message.invocations)) {
-                    for (const invocation of message.invocations) {
-                        if (invocation.function) {
-                            if (invocation.function.name) {
-                                inputTokens += await countTokens(invocation.function.name);
-                            }
-                            if (invocation.function.arguments) {
-                                inputTokens += await countTokens(invocation.function.arguments);
-                            }
-                        }
-                    }
-                }
-                // Count deprecated function_call tokens
-                if (message.function_call) {
-                    if (message.function_call.name) {
-                        inputTokens += await countTokens(message.function_call.name);
-                    }
-                    if (message.function_call.arguments) {
-                        inputTokens += await countTokens(message.function_call.arguments);
-                    }
-                }
-            }
-            // Add overhead for message formatting (rough estimate: ~3 tokens per message boundary)
-            inputTokens += generate_data.prompt.length * 3;
-        }
-    }
-
-    return inputTokens;
+    // Later GENERATE_AFTER_DATA listeners may still edit the prompt in place; read it after they ran
+    await new Promise(resolve => setTimeout(resolve));
+    const { texts, fixedTokens } = collectPromptTexts(generate_data.prompt);
+    return fixedTokens + await tokenCounter.countAll(texts);
 }
 
 /**
@@ -776,7 +713,8 @@ function handleGenerationStarted(type, params, isDryRun) {
     if (type === 'continue') {
         try {
             const context = getContext();
-            const lastMessage = context.chat[context.chat.length - 1];
+            const sourceMessage = context.chat[context.chat.length - 1];
+            const lastMessage = sourceMessage && { mes: sourceMessage.mes, extra: { ...sourceMessage.extra } };
 
             if (lastMessage) {
                 // Use existing token count if available (fast path)
@@ -843,6 +781,7 @@ function handleGenerateAfterData(generate_data, dryRun) {
         });
 
     const attempt = attemptTracker.begin(kind, {
+        usageRevision,
         genType,
         modelId,
         sourceId,
@@ -924,7 +863,7 @@ function handleGenerationEnded() {
     const start = pendingGenerationStart;
     if (!attempt && start?.armed && start.type !== 'quiet') {
         pendingGenerationStart = null;
-        attempt = attemptTracker.begin('main', { genType: start.type, modelId: start.modelId,
+        attempt = attemptTracker.begin('main', { usageRevision, genType: start.type, modelId: start.modelId,
             sourceId: start.sourceId, chatId: start.chatId,
             fallbackRoute: start.fallbackRoute });
     }
@@ -997,12 +936,15 @@ function recordInferredFailure(attempt) {
  */
 async function recordAttempt(attempt, status, details) {
     const { chatId, modelId, sourceId } = attempt.meta;
+    const revision = attempt.meta.usageRevision ?? usageRevision;
+    if (revision !== usageRevision) return;
 
     if (status === 'failed') {
         recordFailedAttempt(chatId, modelId, sourceId);
         return;
     }
 
+    await attempt.meta.responseInspection;
     let outputTokens = 0;
     let reasoningTokens = 0;
 
@@ -1019,7 +961,12 @@ async function recordAttempt(attempt, status, details) {
         if (reasoning) reasoningTokens = await countTokens(reasoning);
     }
 
+    for (const alternative of attempt.meta.additionalChoices || []) {
+        if (alternative.text) outputTokens += await countTokens(alternative.text);
+        if (alternative.reasoning) reasoningTokens += await countTokens(alternative.reasoning);
+    }
     const inputTokens = (await attempt.meta.inputTokensPromise) || 0;
+    if (revision !== usageRevision) return;
     recordUsage(inputTokens, outputTokens, chatId, modelId, sourceId, reasoningTokens, status === 'stopped' ? 'stopped' : 'succeeded');
 }
 
@@ -1032,6 +979,7 @@ async function recordAttempt(attempt, status, details) {
  * @returns {Promise<{outputTokens: number, reasoningTokens: number}>}
  */
 async function countMessageOutput(message, attempt) {
+    message = { mes: message.mes, extra: { ...message.extra } };
     let outputTokens;
     let reasoningTokens = 0;
 
@@ -1043,7 +991,7 @@ async function countMessageOutput(message, attempt) {
     // token_count may include reasoning tokens, so subtract them to get just response tokens
     if (message.extra?.token_count && typeof message.extra.token_count === 'number') {
         outputTokens = message.extra.token_count;
-        if (reasoningTokens > 0 && message.extra.token_count > reasoningTokens) {
+        if (reasoningTokens > 0 && message.extra.token_count >= reasoningTokens) {
             outputTokens = message.extra.token_count - reasoningTokens;
         }
     } else {
@@ -1052,7 +1000,9 @@ async function countMessageOutput(message, attempt) {
 
     // For 'continue', only count the newly generated tokens
     if (attempt.meta.genType === 'continue' && attempt.meta.preContinuePromise) {
-        const preContinueTokenCount = await attempt.meta.preContinuePromise;
+        const preContinueTotal = await attempt.meta.preContinuePromise;
+        const previousReasoning = attempt.meta.preContinueReasoning ? await countTokens(attempt.meta.preContinueReasoning) : 0;
+        const preContinueTokenCount = Math.max(0, preContinueTotal - previousReasoning);
         if (preContinueTokenCount > 0) {
             const fullOutputTokens = outputTokens;
             outputTokens = Math.max(0, outputTokens - preContinueTokenCount);
@@ -1060,6 +1010,9 @@ async function countMessageOutput(message, attempt) {
         }
     }
 
+    if (attempt.meta.genType === 'continue' && attempt.meta.preContinueReasoning && message.extra?.reasoning?.startsWith(attempt.meta.preContinueReasoning)) {
+        reasoningTokens = Math.max(0, reasoningTokens - await countTokens(attempt.meta.preContinueReasoning));
+    }
     return { outputTokens, reasoningTokens };
 }
 
@@ -1117,8 +1070,8 @@ function registerSlashCommands() {
 
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'tokenreset',
-        callback: async (args) => {
-            const scope = String(args || '').trim() || 'session';
+        callback: async (_args, value) => {
+            const scope = String(value || '').trim() || 'session';
             if (scope === 'all') {
                 resetAllUsage();
                 return 'All token usage data has been reset.';
@@ -1127,6 +1080,7 @@ function registerSlashCommands() {
                 return 'Session token usage has been reset.';
             }
         },
+        unnamedArgumentList: [SlashCommandArgument.fromProps({ description: 'session or all', isRequired: false, typeList: [ARGUMENT_TYPE.STRING] })],
         returns: 'Confirmation message',
         helpString: 'Resets token usage. Use /tokenreset for session only, or /tokenreset all for all data.',
     }));
@@ -1140,7 +1094,7 @@ function registerSlashCommands() {
             let totalCost = 0;
 
             for (const [modelId, data] of Object.entries(byModel)) {
-                const cost = calculateCost(data.input, data.output, modelId);
+                const cost = calculateCost(data.input, data.output + (data.reasoning || 0), modelId);
                 totalCost += cost;
                 if (cost > 0) {
                     lines.push(`• ${modelId}: $${cost.toFixed(4)} (${formatNumberFull(data.input)} in, ${formatNumberFull(data.output)} out)`);
@@ -1578,7 +1532,7 @@ function calculateAllTimeCost() {
     let totalCost = 0;
 
     for (const [modelId, data] of Object.entries(byModel)) {
-        totalCost += calculateCost(data.input, data.output, modelId);
+        totalCost += calculateCost(data.input, data.output + (data.reasoning || 0), modelId);
     }
     return totalCost;
 }
@@ -1684,65 +1638,14 @@ function importUsageData(jsonString) {
 
     const settings = getSettings();
 
-    // Import usage data (replace, not merge, to avoid doubling stats)
-    if (data.usage.session) {
-        // Don't import session data - it's ephemeral
-    }
-
-    // Replace byDay data (overwrite existing days to prevent doubling)
-    if (data.usage.byDay) {
-        for (const [dayKey, dayData] of Object.entries(sanitizeUsageBuckets(data.usage.byDay))) {
-            settings.usage.byDay[dayKey] = dayData;
-        }
-    }
-
-    // Replace byHour data (overwrite existing hours to prevent doubling)
-    if (data.usage.byHour) {
-        for (const [hourKey, hourData] of Object.entries(sanitizeUsageBuckets(data.usage.byHour))) {
-            settings.usage.byHour[hourKey] = hourData;
-        }
-    }
-
-    // Replace byWeek data
-    if (data.usage.byWeek) {
-        for (const [weekKey, weekData] of Object.entries(sanitizeUsageBuckets(data.usage.byWeek))) {
-            settings.usage.byWeek[weekKey] = weekData;
-        }
-    }
-
-    // Replace byMonth data
-    if (data.usage.byMonth) {
-        for (const [monthKey, monthData] of Object.entries(sanitizeUsageBuckets(data.usage.byMonth))) {
-            settings.usage.byMonth[monthKey] = monthData;
-        }
-    }
-
-    // Replace byChat data
-    if (data.usage.byChat) {
-        for (const [chatId, chatData] of Object.entries(sanitizeUsageBuckets(data.usage.byChat))) {
-            settings.usage.byChat[chatId] = chatData;
-        }
-    }
-
-    // Replace byModel data
-    if (data.usage.byModel) {
-        for (const [modelId, modelData] of Object.entries(sanitizeUsageBuckets(data.usage.byModel))) {
-            settings.usage.byModel[modelId] = modelData;
-        }
-    }
-
-    // Replace bySource data
-    if (data.usage.bySource) {
-        for (const [sourceId, sourceData] of Object.entries(sanitizeUsageBuckets(data.usage.bySource))) {
-            settings.usage.bySource[sourceId] = sourceData;
-        }
-    }
-
-    // Replace allTime data
-    const allTime = sanitizeUsageBucket(data.usage.allTime);
-    if (allTime) {
-        settings.usage.allTime = allTime;
-    }
+    const allTime = sanitizeUsageBucket(data.usage.allTime ?? settings.usage.allTime ?? {});
+    if (!allTime) throw new Error('Backup has no valid all-time usage');
+    const replacement = { session: settings.usage.session, allTime,
+        outcomesTrackedSince: data.usage.outcomesTrackedSince || null };
+    for (const key of ['byDay','byHour','byWeek','byMonth','byChat','byModel','bySource']) replacement[key] = sanitizeUsageBuckets(data.usage[key] || {});
+    usageRevision++;
+    settings.usage = replacement;
+    currentPeriodDays = null;
 
     // Replace model prices (overwrite existing)
     if (pricingSnapshot) {
@@ -1779,6 +1682,7 @@ function importUsageData(jsonString) {
 }
 
 // Chart state
+let currentPeriodDays = null;
 let currentChartRange = 30;
 let currentSourceFilter = 'all'; // 'all' or specific source ID like 'openai', 'textgenerationwebui'
 let currentChartType = 'bar'; // 'bar' or 'line'
@@ -1895,8 +1799,7 @@ function createSVGElement(type, attrs = {}) {
  * @param {string} sourceFilter - Source to filter by, or 'all' for combined
  */
 function getChartData(days, sourceFilter = 'all') {
-    const stats = getUsageStats();
-    const byDay = stats.byDay || {};
+    const byDay = getSettings().usage.byDay || {};
     const data = [];
     const today = getCurrentEasternTime();
     const { year, month, day } = getEasternParts(today);
@@ -2010,7 +1913,7 @@ function getHourlyChartData(hours, sourceFilter = 'all') {
 function getChartDataForGranularity() {
     if (currentGranularity === 'hourly') {
         // Map range days to hours: 1D = 24h, 7D = 24*3h = 72h (every 3 hours for a week), 30D = 24*7h = 168h, 90D = 24*14h = 336h
-        const hoursMap = { 1: 24, 7: 72, 30: 168, 90: 336 };
+        const hoursMap = { 1: 24, 7: 168, 30: 720, 90: 2160 };
         const hours = hoursMap[currentChartRange] || 24;
         return getHourlyChartData(hours, currentSourceFilter);
     }
@@ -2054,7 +1957,7 @@ function getRangeTotals(rangeDays, sourceFilter = 'all') {
             if (sourceData.models) {
                 for (const [mid, modelData] of Object.entries(sourceData.models)) {
                     const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
-                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                    const mOutput = typeof modelData === 'number' ? 0 : ((modelData.output || 0) + (modelData.reasoning || 0));
                     totals.cost += calculateCost(mInput, mOutput, mid);
                 }
             }
@@ -2070,7 +1973,7 @@ function getRangeTotals(rangeDays, sourceFilter = 'all') {
         if (dayData.models) {
             for (const [mid, modelData] of Object.entries(dayData.models)) {
                 const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
-                const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                const mOutput = typeof modelData === 'number' ? 0 : ((modelData.output || 0) + (modelData.reasoning || 0));
                 totals.cost += calculateCost(mInput, mOutput, mid);
             }
         }
@@ -2572,7 +2475,7 @@ function showTooltip(d) {
                 outputTokens = Math.round(modelData * 0.5);
             } else {
                 inputTokens = modelData.input || 0;
-                outputTokens = modelData.output || 0;
+                outputTokens = (modelData.output || 0) + (modelData.reasoning || 0);
             }
             const cost = calculateCost(inputTokens, outputTokens, model);
             modelCosts[model] = cost;
@@ -2739,9 +2642,12 @@ function updateChartRange(range) {
  */
 function updateSourceFilter(sourceId) {
     currentSourceFilter = sourceId;
-    chartData = getChartDataForGranularity();
-    renderChartByType();
-    updateRangeSummary();
+    // updateUIStats renders these itself unless the panel is hidden
+    if (!isUsagePanelVisible()) {
+        chartData = getChartDataForGranularity();
+        renderChartByType();
+        updateRangeSummary();
+    }
     updateUIStats();
 }
 
@@ -2805,19 +2711,72 @@ function updateSourceDropdown() {
     }
 }
 
+function isUsagePanelVisible() {
+    const panelContent = document.querySelector('#token-usage-main-content');
+    return Boolean(panelContent && panelContent.offsetParent !== null);
+}
+
+/**
+ * The days counted as this week and this month, so updates need not classify all of history.
+ * A day's period never changes; cleared when a day is added and when an import may add days.
+ * @param {object} byDay - settings.usage.byDay
+ * @param {string} weekKey - Current week
+ * @param {string} monthKey - Current month
+ * @returns {{weekDays: string[], monthDays: string[]}}
+ */
+function getCurrentPeriodDays(byDay, weekKey, monthKey) {
+    if (currentPeriodDays?.byDay === byDay && currentPeriodDays.weekKey === weekKey && currentPeriodDays.monthKey === monthKey) {
+        return currentPeriodDays;
+    }
+
+    const weekDays = [];
+    const monthDays = [];
+    for (const dayKey of Object.keys(byDay)) {
+        // Parse dayKey (YYYY-MM-DD) as local date, not UTC
+        // new Date("2026-01-01") interprets as UTC, which shifts timezone
+        const [year, month, day] = dayKey.split('-').map(Number);
+        const date = new Date(year, month - 1, day);
+        if (getWeekKey(date) === weekKey) weekDays.push(dayKey);
+        if (getMonthKey(date) === monthKey) monthDays.push(dayKey);
+    }
+    currentPeriodDays = { byDay, weekKey, monthKey, weekDays, monthDays };
+    return currentPeriodDays;
+}
+
+/**
+ * Cost of the given days using their per-model input/output breakdown, at current prices
+ * @param {object} byDay - settings.usage.byDay
+ * @param {string[]} dayKeys
+ * @returns {number}
+ */
+function calculateDaysCost(byDay, dayKeys) {
+    let cost = 0;
+    for (const dayKey of dayKeys) {
+        const models = byDay[dayKey]?.models;
+        if (!models) continue;
+        for (const [mid, modelData] of Object.entries(models)) {
+            // modelData is now { input, output, total } (or number for legacy data)
+            const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
+            const mOutput = typeof modelData === 'number' ? 0 : ((modelData.output || 0) + (modelData.reasoning || 0));
+            cost += calculateCost(mInput, mOutput, mid);
+        }
+    }
+    return cost;
+}
+
 /**
  * Update the stats display in the UI
+ * @param {object} [statsParam] - Stats already computed by the caller
  */
-function updateUIStats() {
-    const stats = getUsageStats();
+function updateUIStats(statsParam) {
+    const stats = statsParam || getUsageStats();
     const now = getCurrentEasternTime();
 
     // Today header
     $('#token-usage-mini-counter').text(formatTokens(stats.today.total));
 
     // If the settings panel is collapsed/hidden, only update miniview and header counter
-    const panelContent = document.querySelector('#token-usage-main-content');
-    if (!panelContent || panelContent.offsetParent === null) {
+    if (!isUsagePanelVisible()) {
         modelConfigState.needsRefresh = true;
         updateMiniviewStats(stats);
         return;
@@ -2837,46 +2796,12 @@ function updateUIStats() {
         $('#token-usage-alltime-cost').text('$0.00');
     }
 
-    // For Week/Month: We iterate all `byDay` keys and match those that belong to current week/month
-    const currentWeekKey = getWeekKey(now);
-    const currentMonthKey = getMonthKey(now);
+    // Week/Month: price only the days in the current periods, so price changes apply immediately
+    const { byDay } = getSettings().usage;
+    const { weekDays, monthDays } = getCurrentPeriodDays(byDay, getWeekKey(now), getMonthKey(now));
 
-    let weekCost = 0;
-    let monthCost = 0;
-
-    const settings = getSettings();
-    for (const [dayKey, data] of Object.entries(settings.usage.byDay)) {
-        // Parse dayKey (YYYY-MM-DD) as local date, not UTC
-        // new Date("2026-01-01") interprets as UTC, which shifts timezone
-        const [year, month, day] = dayKey.split('-').map(Number);
-        const date = new Date(year, month - 1, day);
-
-        // Week check
-        if (getWeekKey(date) === currentWeekKey) {
-            // Calculate cost for this day using per-model input/output breakdown
-            if (data.models) {
-                for (const [mid, modelData] of Object.entries(data.models)) {
-                    // modelData is now { input, output, total } (or number for legacy data)
-                    const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
-                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
-                    weekCost += calculateCost(mInput, mOutput, mid);
-                }
-            }
-        }
-        // Month check
-        if (getMonthKey(date) === currentMonthKey) {
-            if (data.models) {
-                for (const [mid, modelData] of Object.entries(data.models)) {
-                    const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
-                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
-                    monthCost += calculateCost(mInput, mOutput, mid);
-                }
-            }
-        }
-    }
-
-    $('#token-usage-week-cost').text(`$${weekCost.toFixed(2)}`);
-    $('#token-usage-month-cost').text(`$${monthCost.toFixed(2)}`);
+    $('#token-usage-week-cost').text(`$${calculateDaysCost(byDay, weekDays).toFixed(2)}`);
+    $('#token-usage-month-cost').text(`$${calculateDaysCost(byDay, monthDays).toFixed(2)}`);
 
     $('#token-usage-tokenizer').text('Tokenizer: ' + (stats.tokenizer || 'Unknown'));
 
@@ -2979,7 +2904,7 @@ function updateChatUsageDisplay() {
     if (chatUsage.models) {
         for (const [mid, modelData] of Object.entries(chatUsage.models)) {
             const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
-            const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+            const mOutput = typeof modelData === 'number' ? 0 : ((modelData.output || 0) + (modelData.reasoning || 0));
             chatCost += calculateCost(mInput, mOutput, mid);
         }
     }
@@ -3489,7 +3414,7 @@ function updateMiniviewStats(statsParam) {
             if (settings.usage.session.models) {
                 for (const [mid, modelData] of Object.entries(settings.usage.session.models)) {
                     const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
-                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                    const mOutput = typeof modelData === 'number' ? 0 : ((modelData.output || 0) + (modelData.reasoning || 0));
                     cost += calculateCost(mInput, mOutput, mid);
                 }
             }
@@ -3510,7 +3435,7 @@ function updateMiniviewStats(statsParam) {
             if (hourData.models) {
                 for (const [mid, modelData] of Object.entries(hourData.models)) {
                     const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
-                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                    const mOutput = typeof modelData === 'number' ? 0 : ((modelData.output || 0) + (modelData.reasoning || 0));
                     cost += calculateCost(mInput, mOutput, mid);
                 }
             }
@@ -3524,7 +3449,7 @@ function updateMiniviewStats(statsParam) {
             if (dayData?.models) {
                 for (const [mid, modelData] of Object.entries(dayData.models)) {
                     const mInput = typeof modelData === 'number' ? 0 : (modelData.input || 0);
-                    const mOutput = typeof modelData === 'number' ? 0 : (modelData.output || 0);
+                    const mOutput = typeof modelData === 'number' ? 0 : ((modelData.output || 0) + (modelData.reasoning || 0));
                     cost += calculateCost(mInput, mOutput, mid);
                 }
             }
@@ -4298,7 +4223,6 @@ function createSettingsUI() {
     $('#token-usage-reset-all').on('click', function () {
         if (confirm('Are you sure you want to reset ALL token usage data? This cannot be undone.')) {
             resetAllUsage();
-            updateUIStats();
             toastr.success('All stats reset');
         }
     });
@@ -4517,7 +4441,7 @@ function observeGenerationRequest(input, init, requestContext = null) {
     if (!attempt && !route) return null;
     const observation = { attempt, route: route || attempt?.meta.fallbackRoute, streaming, signal,
         genType: attempt?.meta.genType || '' };
-    if (attempt) attempt.meta.requestObservation = observation;
+    if (attempt) { attempt.meta.requestObservation = observation; attempt.meta.multipleCompletions = Number(body?.n) > 1 || Number(body?.num_return_sequences) > 1; }
     return observation;
 }
 
@@ -4555,7 +4479,7 @@ function isAbortedRequest(observation, error) {
  */
 function observeGenerationResponse(observation, request) {
     const { attempt, route, streaming } = observation;
-    request.then(
+    const inspection = request.then(
         (response) => {
             if (!response.ok) {
                 attemptTracker.requestSettled(attempt, 'failed');
@@ -4577,6 +4501,7 @@ function observeGenerationResponse(observation, request) {
     ).catch(error => {
         console.error('[Token Usage Tracker] Error observing generation response:', error);
     });
+    if (attempt) attempt.meta.responseInspection = inspection;
 }
 
 /**
@@ -4613,7 +4538,7 @@ async function inspectResponse(observation, response) {
     const { attempt, route } = observation;
     let data = null;
     try {
-        if (attempt?.kind === 'quiet') {
+        if (attempt?.kind === 'quiet' || attempt?.meta.multipleCompletions) {
             // Quiet generations have no final message event: their actual output
             // is required for accurate token counts, not merely diagnostics.
             data = await response.json();
@@ -4627,7 +4552,10 @@ async function inspectResponse(observation, response) {
     }
 
     const error = payloadError(data);
-    if (attempt) attempt.meta.hasToolCalls = payloadHasToolCalls(data);
+    if (attempt) {
+        attempt.meta.hasToolCalls = payloadHasToolCalls(data);
+        attempt.meta.additionalChoices = Array.isArray(data?.choices) ? data.choices.slice(1).map(choice => ({ text: choice.message?.content || choice.text || '', reasoning: choice.message?.reasoning_content || choice.message?.reasoning || '' })) : [];
+    }
     if (route) {
         const routeError = error && { kind: 'response', status: statusFromReason(error.message), ...error };
         recordRouteResult(observation, routeError, payloadProvider(data));
@@ -4684,11 +4612,20 @@ async function recordHttpError(observation, response) {
 async function watchStreamedResponse(observation, response) {
     const reader = response.body?.getReader();
     if (!reader) return;
-    const scanner = createStreamScanner();
+    const additional = new Map();
+    const scanner = createStreamScanner({ onData: data => {
+        for (const choice of data.choices || []) {
+            if (!(choice.index > 0)) continue;
+            const current = additional.get(choice.index) || { text: '', reasoning: '' };
+            current.text += choice.delta?.content || choice.text || '';
+            current.reasoning += choice.delta?.reasoning_content || choice.delta?.reasoning || '';
+            additional.set(choice.index, current);
+        }
+    } });
     const decoder = new TextDecoder();
     let error = null;
     try {
-        while (!error) {
+        while (!error && !scanner.done) {
             const { done, value } = await reader.read();
             if (done) {
                 const errors = [...scanner.push(decoder.decode()), ...scanner.finish()];
@@ -4717,6 +4654,7 @@ async function watchStreamedResponse(observation, response) {
         reader.cancel().catch(() => {});
         reader.releaseLock?.();
     }
+    if (observation.attempt) observation.attempt.meta.additionalChoices = [...additional.values()];
     observation.oversizedStreamFrames = scanner.oversizedFrames;
 
     if (observation.attempt) observation.attempt.meta.hasToolCalls ||= scanner.hasToolCalls;
@@ -4794,48 +4732,54 @@ function tryPatchSendRequest() {
 
         const originalSendRequest = ServiceClass.sendRequest.bind(ServiceClass);
 
-        ServiceClass.sendRequest = async function (profileId, messages, maxTokens, custom, overridePayload) {
-            // Best-effort: captures the globally-selected model/source at call time.
-            // May not reflect the actual model used if the extension overrides it.
-            const modelId = getCurrentModelId();
-            const sourceId = getCurrentSourceId();
-
-            // State is per call so concurrent requests are each tracked
-            const inputTokensPromise = countInputTokens({ prompt: messages }).catch(e => {
-                console.error('[Token Usage Tracker] Error counting sendRequest input:', e);
-                return 0;
-            });
-
+        ServiceClass.sendRequest = async function (profileId, messages, maxTokens, custom = {}, overridePayload = {}) {
+            const revision = usageRevision;
+            const profile = ServiceClass.getProfile?.(profileId)
+                || context.extensionSettings?.connectionManager?.profiles?.find(p => p.id === profileId);
+            const route = profile ? context.CONNECT_API_MAP?.[profile.api] : null;
+            const modelId = overridePayload.model || profile?.model || getCurrentModelId();
+            const sourceId = overridePayload.chat_completion_source || overridePayload.api_type || route?.source || route?.type || profile?.api || getCurrentSourceId();
+            const inputTokensPromise = countInputTokens({ prompt: messages });
+            // Observe failures even if the provider answers before input tokenization.
+            inputTokensPromise.catch(() => {});
+            const isAbort = error => {
+                if (custom?.signal?.aborted) return true;
+                for (let cause = error, depth = 0; cause && depth < 8; cause = cause.cause, depth++) if (cause.name === 'AbortError') return true;
+                return false;
+            };
+            const account = async (value, outcome = 'succeeded') => {
+                const input = await inputTokensPromise.catch(() => 0);
+                let output = 0, reasoning = 0;
+                const choices = Array.isArray(value?.choices) ? value.choices.map(choice => choice.message || choice.delta || choice) : [value];
+                for (const choice of choices) {
+                    const text = typeof choice === 'string' ? choice : choice?.content || choice?.text || '';
+                    const thought = choice?.reasoning || choice?.reasoning_content || choice?.state?.reasoning || '';
+                    if (typeof text === 'string' && text) output += await countTokens(text);
+                    if (typeof thought === 'string' && thought) reasoning += await countTokens(thought);
+                }
+                if (revision !== usageRevision) return;
+                if (outcome === 'failed') recordFailedAttempt(null, modelId, sourceId);
+                else recordUsage(input, output, null, modelId, sourceId, reasoning, outcome);
+            };
             let result;
-            try {
-                result = await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
-            } catch (error) {
-                inputTokensPromise.then(inputTokens => {
-                    if (error?.name === 'AbortError') {
-                        recordUsage(inputTokens, 0, null, modelId, sourceId, 0, 'stopped');
-                    } else {
-                        recordFailedAttempt(null, modelId, sourceId);
+            try { result = await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload); }
+            catch (error) { void account('', isAbort(error) ? 'stopped' : 'failed').catch(console.error); throw error; }
+            if (typeof result === 'function') {
+                let accounted = false;
+                return async function* (...args) {
+                    let latest = {}, outcome = 'stopped';
+                    try {
+                        for await (const chunk of result(...args)) { latest = chunk; yield chunk; }
+                        outcome = 'succeeded';
+                    } catch (error) { outcome = isAbort(error) ? 'stopped' : 'failed'; throw error; }
+                    finally {
+                        const alternatives = (latest.swipes || []).filter(text => typeof text === 'string' && text && text !== latest.text);
+                        const value = { choices: [{ message: { content: latest.text || '', reasoning: latest.state?.reasoning || '' } }, ...alternatives.map(content => ({ message: { content } }))] };
+                        if (!accounted) { accounted = true; void account(value, outcome).catch(console.error); }
                     }
-                }).catch(e => console.error('[Token Usage Tracker] Error recording sendRequest failure:', e));
-                throw error;
+                };
             }
-
-            try {
-                const inputTokens = await inputTokensPromise;
-                let outputTokens = 0;
-                if (result && typeof result.content === 'string') {
-                    outputTokens = await countTokens(result.content);
-                } else if (typeof result === 'string') {
-                    outputTokens = await countTokens(result);
-                }
-
-                if (outputTokens > 0 || inputTokens > 0) {
-                    recordUsage(inputTokens, outputTokens, null, modelId, sourceId);
-                }
-            } catch (e) {
-                console.error('[Token Usage Tracker] Error counting sendRequest output:', e);
-            }
-
+            void account(result).catch(console.error);
             return result;
         };
 

@@ -51,8 +51,8 @@ test('the real slash command downloads CSV and retains JSON import/export comman
     const commands = new Map();
     let blob, timer, revoked, clicked = false, removed = false;
     const link = { click() { clicked = true; }, remove() { removed = true; } };
-    const context = vm.createContext({
-        SlashCommandParser: { addCommandObject: command => commands.set(command.name, command) },
+    const context = vm.createContext({ usageRevision: 0,
+        ARGUMENT_TYPE: { STRING: 'string' }, SlashCommandParser: { addCommandObject: command => commands.set(command.name, command) },
         SlashCommand: { fromProps: props => props }, SlashCommandArgument: { fromProps: props => props },
         buildUsageCsv, Blob, getSettings: () => ({ usage: { byChat: { custom: { total: 42 } } } }),
         calculateCost: () => 0, getDayKey: () => '2026-10-10',
